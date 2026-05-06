@@ -55,14 +55,17 @@ def main():
             skip += 1
             continue
         try:
-            req('POST', f'/api/decks/{deck_id}/questions', {
+            payload = {
                 'question':      text,
                 'model_answer':  q['model_answer'] or '',
                 'key_points':    q['key_points'] or '[]',
                 'category':      q['category'] or '',
                 'guideline_ref': q['guideline_ref'] or '',
                 'flowchart':     q['flowchart'] or '',
-            })
+            }
+            if q['mcq_options']:
+                payload['mcq_options'] = json.loads(q['mcq_options'])
+            req('POST', f'/api/decks/{deck_id}/questions', payload)
             existing.add(text)
             ok += 1
         except Exception as e:

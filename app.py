@@ -272,12 +272,14 @@ def add_question(deck_id):
     if not question:
         return jsonify({'error': '問題文は必須です'}), 400
     conn = get_db()
+    mcq_options = d.get('mcq_options')  # pre-cached options from push script
     cur = conn.execute(
-        'INSERT INTO questions(deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,created_at) VALUES(?,?,?,?,?,?,?,?)',
+        'INSERT INTO questions(deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,mcq_options,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
         (deck_id, (d.get('category') or '').strip(), question,
          d.get('model_answer', ''),
          json.dumps(d.get('key_points', []), ensure_ascii=False),
          d.get('guideline_ref', ''), d.get('flowchart', ''),
+         json.dumps(mcq_options) if mcq_options else None,
          datetime.now().strftime('%Y-%m-%d %H:%M')))
     conn.commit()
     conn.close()
@@ -800,6 +802,63 @@ def get_mcq(q_id):
         return jsonify({'error': str(e)}), 500
     conn.close()
     return jsonify(result)
+
+@app.route('/api/mcq/generate-all', methods=['POST'])
+def generate_all_mcq():
+    """mcq_options が NULL の全問題に対して一括生成してキャッシュする。"""
+    d = request.get_json(force=True)
+    api_key = d.get('api_key') or ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'api_key required'}), 400
+    import random
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT id, question, model_answer, key_points FROM questions WHERE mcq_options IS NULL'
+    ).fetchall()
+    conn.close()
+    total = len(rows)
+    if total == 0:
+        return jsonify({'ok': True, 'generated': 0, 'message': 'すでに全問キャッシュ済みです'})
+    client = anthropic.Anthropic(api_key=api_key)
+    ok = err = 0
+    for row in rows:
+        kps = json.loads(row['key_points'] or '[]')
+        answer_text = row['model_answer'] or '\n'.join(
+            f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
+        prompt = f"""以下の記述式問題と正解をもとに、4択選択肢を日本語で作成してください。
+
+問題: {row['question']}
+
+正解の要点:
+{answer_text[:600]}
+
+要件:
+- 選択肢は4つ（正解1つ＋紛らわしい誤答3つ）
+- 正解は模範解答の核心を1〜2文で簡潔にまとめる
+- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆など）
+- 各選択肢は30〜60字程度
+
+必ずこのJSONのみを返してください（前後にテキスト不要）:
+{{"options":["正解テキスト","誤答1","誤答2","誤答3"],"correct_index":0}}"""
+        try:
+            msg = client.messages.create(
+                model='claude-haiku-4-5-20251001', max_tokens=600,
+                messages=[{'role': 'user', 'content': prompt}])
+            raw = msg.content[0].text.strip()
+            data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+            options = data['options']
+            correct = options[data['correct_index']]
+            random.shuffle(options)
+            result = {'options': options, 'correct_index': options.index(correct)}
+            c = get_db()
+            c.execute('UPDATE questions SET mcq_options=? WHERE id=?',
+                      (json.dumps(result, ensure_ascii=False), row['id']))
+            c.commit()
+            c.close()
+            ok += 1
+        except Exception:
+            err += 1
+    return jsonify({'ok': True, 'generated': ok, 'errors': err, 'total': total})
 
 @app.route('/api/score-mcq', methods=['POST'])
 def score_mcq():
