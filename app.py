@@ -92,7 +92,12 @@ def init_db():
             likes INTEGER DEFAULT 0,
             created_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS wallet (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            balance INTEGER NOT NULL DEFAULT 0
+        );
     ''')
+    conn.execute('INSERT OR IGNORE INTO wallet(id, balance) VALUES(1, 0)')
     conn.commit()
     conn.close()
 
@@ -389,11 +394,18 @@ def score_sync():
     if not result:
         return jsonify({'error': '採点結果の解析に失敗しました'}), 500
 
+    COIN_MAP = {'S': 50, 'A': 40, 'B': 30, 'C': 20, 'D': 10}
     if answer.strip():
         raw = result.get('score', 0)
         result['score'] = min(100, round(40 + raw * 0.6))
         grades = [('S',90),('A',75),('B',60),('C',40),('D',0)]
         result['grade'] = next(g for g, t in grades if result['score'] >= t)
+        earned = COIN_MAP.get(result['grade'], 10)
+        result['coins_earned'] = earned
+        conn2 = get_db()
+        conn2.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (earned,))
+        conn2.commit()
+        conn2.close()
     _save_attempt(qid, result, answer)
     return jsonify(result)
 
@@ -680,6 +692,57 @@ def get_stats():
         'decks':          deck_stats,
     })
 
+# ── Wallet ───────────────────────────────────────────────────
+@app.route('/api/wallet')
+def get_wallet():
+    conn = get_db()
+    row = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()
+    conn.close()
+    return jsonify({'balance': row['balance'] if row else 0})
+
+@app.route('/api/wallet/spend', methods=['POST'])
+def spend_wallet():
+    d = request.get_json(force=True)
+    cost = int(d.get('cost', 0))
+    conn = get_db()
+    row = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()
+    balance = row['balance'] if row else 0
+    if balance < cost:
+        conn.close()
+        return jsonify({'error': '石が足りません'}), 400
+    conn.execute('UPDATE wallet SET balance = balance - ? WHERE id=1', (cost,))
+    conn.commit()
+    new_balance = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    conn.close()
+    return jsonify({'balance': new_balance})
+
+@app.route('/api/wallet/earn', methods=['POST'])
+def earn_wallet():
+    d = request.get_json(force=True)
+    amount = int(d.get('amount', 0))
+    conn = get_db()
+    conn.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (amount,))
+    conn.commit()
+    new_balance = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    conn.close()
+    return jsonify({'balance': new_balance})
+
+@app.route('/api/questions/<int:q_id>/hint')
+def get_hint(q_id):
+    conn = get_db()
+    row = conn.execute('SELECT key_points, flowchart, category FROM questions WHERE id=?', (q_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'error': 'not found'}), 404
+    kps = json.loads(row['key_points'] or '[]')
+    hints = [k['t'] for k in kps if isinstance(k, dict) and k.get('t')]
+    return jsonify({
+        'category': row['category'],
+        'flowchart': row['flowchart'] or '',
+        'key_count': len(hints),
+        'first_hint': hints[0] if hints else '',
+    })
+
 # ── Backup / Restore ─────────────────────────────────────────
 @app.route('/api/backup')
 def backup():
@@ -690,6 +753,7 @@ def backup():
         'attempts':       [dict(r) for r in conn.execute('SELECT * FROM attempts').fetchall()],
         'results':        [dict(r) for r in conn.execute('SELECT * FROM results').fetchall()],
         'ghost_messages': [dict(r) for r in conn.execute('SELECT * FROM ghost_messages').fetchall()],
+        'wallet':         [dict(r) for r in conn.execute('SELECT * FROM wallet').fetchall()],
     }
     conn.close()
     return jsonify(data)
@@ -722,6 +786,9 @@ def restore():
              r.get('answer',''), r.get('model_answer',''),
              r.get('covered','[]'), r.get('partial','[]'), r.get('missed','[]'),
              r.get('feedback',''), r.get('advice',''), r.get('saved_at','')))
+    for w in data.get('wallet', []):
+        conn.execute('INSERT OR REPLACE INTO wallet(id, balance) VALUES(?,?)',
+            (w['id'], w['balance']))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
