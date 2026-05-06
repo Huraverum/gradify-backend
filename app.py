@@ -84,9 +84,45 @@ def init_db():
             advice TEXT,
             attempted_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS ghost_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            square INTEGER NOT NULL,
+            message TEXT NOT NULL,
+            author TEXT,
+            likes INTEGER DEFAULT 0,
+            created_at TEXT
+        );
     ''')
     conn.commit()
     conn.close()
+
+GHOST_SEEDS = [
+    (1,  "ここから全てが始まった。震えていたことを今でも覚えている。", "名もなき先輩"),
+    (3,  "三歩進んで二歩下がる。それでも前に進め。", "浪人生"),
+    (5,  "最初の五問。意外と手が動いた。", "合格者"),
+    (8,  "もう八マス。諦めなければ必ず進める。", "通りすがりの受験生"),
+    (10, "第一関門を越えた者へ。この先はもっと険しい。だが、越えられる。", "先人"),
+    (13, "十三という数字が不吉だと思っていた。でも何も起きなかった。", "文系浪人"),
+    (15, "折り返しの半分。まだ半分。どちらで見るかで全てが変わる。", "哲学科の学生"),
+    (20, "五分の一。あの頃はこの数字が遠かった。", "医学部再受験生"),
+    (25, "四分の一到達。ここで止まった仲間がいた。あなたは違う。", "元受験生"),
+    (30, "三十マス。疲れただろう。少し休め。でも戻ってこい。", "OB"),
+    (33, "人生の三分の一に似た数字。まだ何でもできる。", "社会人受験生"),
+    (40, "十分の四。誰かが「ここが本当の始まり」と言っていた。", "予備校講師"),
+    (42, "宇宙の答えは42だと聞いた。あなたの答えは何マス先にある？", "理系の誰か"),
+    (50, "半分。ここで泣いた。悔しくて。嬉しくて。両方だった。", "去年の合格者"),
+    (55, "過去問を初めて解いた夜を思い出す。何も解けなかった。", "司法試験合格者"),
+    (60, "六十マス。見えてきた気がする。その感覚を信じろ。", "公認会計士"),
+    (66, "六六六。不吉な数字だと笑ってくれ。あなたはここを越えた。", "受験オタク"),
+    (70, "七十マス。正直、ここまで来ると思っていなかった。", "自分への手紙"),
+    (75, "四分の三。残りが見えてきた。でも油断するな。最後が一番きつい。", "宅建合格者"),
+    (80, "八十マス。あと二十。もう止まれないところまで来た。", "TOEIC満点者"),
+    (88, "八十八夜。お茶ではなく、合格を摘み取れ。", "農学部の誰か"),
+    (90, "九十マス。ここまで来た自分を褒めてやれ。本当に。", "医師国家試験合格者"),
+    (95, "あと五マス。合格の二文字が見えるか？", "司法書士"),
+    (99, "あと一歩。震えているか？それでいい。", "ゴール直前の誰か"),
+    (100,"おめでとう。ここまで来た者だけが知っている景色がある。", "ゴールの向こうから"),
+]
 
 def migrate_db():
     conn = get_db()
@@ -95,6 +131,14 @@ def migrate_db():
         conn.commit()
     except Exception:
         pass
+    # seed ghost messages if empty
+    count = conn.execute('SELECT COUNT(*) FROM ghost_messages').fetchone()[0]
+    if count == 0:
+        now = datetime.now().strftime('%Y-%m-%d %H:%M')
+        conn.executemany(
+            'INSERT INTO ghost_messages(square,message,author,created_at) VALUES(?,?,?,?)',
+            [(sq, msg, author, now) for sq, msg, author in GHOST_SEEDS])
+        conn.commit()
     conn.close()
 
 init_db()
@@ -384,6 +428,45 @@ def upload_questions():
         return jsonify({'questions': _call_extract(blocks, user_key)})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+# ── Ghost Messages API ────────────────────────────────────────
+@app.route('/api/ghost/<int:square>')
+def get_ghost(square):
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT * FROM ghost_messages WHERE square=? ORDER BY likes DESC, id ASC LIMIT 5',
+        (square,)).fetchall()
+    conn.close()
+    return jsonify([{
+        'id': r['id'], 'square': r['square'], 'message': r['message'],
+        'author': r['author'] or '名もなき受験生',
+        'likes': r['likes'], 'created_at': r['created_at'],
+    } for r in rows])
+
+@app.route('/api/ghost', methods=['POST'])
+def post_ghost():
+    d = request.get_json(force=True)
+    square  = d.get('square')
+    message = (d.get('message') or '').strip()
+    author  = (d.get('author') or '名もなき受験生').strip()
+    if not square or not message:
+        return jsonify({'error': 'square と message は必須です'}), 400
+    if len(message) > 100:
+        return jsonify({'error': 'メッセージは100文字以内にしてください'}), 400
+    conn = get_db()
+    conn.execute('INSERT INTO ghost_messages(square,message,author,created_at) VALUES(?,?,?,?)',
+        (square, message, author, datetime.now().strftime('%Y-%m-%d %H:%M')))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/ghost/<int:msg_id>/like', methods=['POST'])
+def like_ghost(msg_id):
+    conn = get_db()
+    conn.execute('UPDATE ghost_messages SET likes=likes+1 WHERE id=?', (msg_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
 # ── Stats API ─────────────────────────────────────────────────
 @app.route('/api/stats')
