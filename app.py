@@ -397,13 +397,22 @@ def get_results():
 @app.route('/api/attempts')
 def get_attempts():
     conn = get_db()
-    rows = conn.execute('SELECT question_id,score,grade,answer,attempted_at FROM attempts ORDER BY attempted_at ASC').fetchall()
+    rows = conn.execute(
+        'SELECT question_id,score,grade,answer,covered,partial,missed,feedback,advice,attempted_at FROM attempts ORDER BY attempted_at ASC'
+    ).fetchall()
     conn.close()
     result = {}
     for r in rows:
         result.setdefault(r['question_id'], []).append({
-            'score': r['score'], 'grade': r['grade'],
-            'at': r['attempted_at'], 'answer': r['answer'] or ''
+            'score':    r['score'],
+            'grade':    r['grade'],
+            'at':       r['attempted_at'],
+            'answer':   r['answer'] or '',
+            'covered':  json.loads(r['covered'] or '[]'),
+            'partial':  json.loads(r['partial'] or '[]'),
+            'missed':   json.loads(r['missed']  or '[]'),
+            'feedback': r['feedback'] or '',
+            'advice':   r['advice']   or '',
         })
     return jsonify(result)
 
