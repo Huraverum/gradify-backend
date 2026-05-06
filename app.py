@@ -19,7 +19,7 @@ ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 def cors(r):
     r.headers['Access-Control-Allow-Origin']  = '*'
     r.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
-    r.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    r.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     return r
 
 @app.route('/', defaults={'path': ''}, methods=['OPTIONS'])
