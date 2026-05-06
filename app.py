@@ -443,6 +443,28 @@ def get_ghost(square):
         'likes': r['likes'], 'created_at': r['created_at'],
     } for r in rows])
 
+NG_WORDS = [
+    # 性的表現
+    'セックス','sex','エロ','ero','ポルノ','porn','naked','nude','ヌード',
+    'おっぱい','ちんこ','まんこ','ちんぽ','アナル','anal','フェラ','手マン',
+    'オナニー','masturbat','レイプ','rape','援交','売春','prostitut',
+    'エッチ','hentai','変態','淫','性器','陰茎','陰部','膣','射精',
+    # 暴力・差別
+    '死ね','殺す','殺せ','ぶっ殺','くたばれ','うせろ',
+    'バカ','馬鹿','アホ','クソ','ゴミ','カス','きもい','気持ち悪い','うざい',
+    'クズ','ブス','デブ','チビ','障害者','キチガイ','精神病',
+    '差別','ヘイト','hate','racist',
+    # 個人情報・スパム
+    'http','https','www','\.com','\.net','\.jp','LINE','twitter','instagram',
+    # その他問題ワード
+    '薬物','覚醒剤','大麻','マリファナ','麻薬','drug',
+    'パスワード','password','クレジット','カード番号',
+]
+
+def _contains_ng(text: str) -> bool:
+    t = text.lower()
+    return any(re.search(ng.lower(), t) for ng in NG_WORDS)
+
 @app.route('/api/ghost', methods=['POST'])
 def post_ghost():
     d = request.get_json(force=True)
@@ -453,6 +475,8 @@ def post_ghost():
         return jsonify({'error': 'square と message は必須です'}), 400
     if len(message) > 100:
         return jsonify({'error': 'メッセージは100文字以内にしてください'}), 400
+    if _contains_ng(message) or _contains_ng(author):
+        return jsonify({'error': '不適切な表現が含まれています。言葉を選んで刻んでください。'}), 400
     conn = get_db()
     conn.execute('INSERT INTO ghost_messages(square,message,author,created_at) VALUES(?,?,?,?)',
         (square, message, author, datetime.now().strftime('%Y-%m-%d %H:%M')))
