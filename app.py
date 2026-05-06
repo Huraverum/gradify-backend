@@ -214,21 +214,41 @@ def get_questions(deck_id):
     category = request.args.get('category', '')
     limit    = request.args.get('limit', type=int)
     shuffle  = request.args.get('shuffle', '0') == '1'
+    mode     = request.args.get('mode', '')   # 'weak' | 'new' | ''
     conn = get_db()
-    if category:
-        rows = conn.execute('SELECT * FROM questions WHERE deck_id=? AND category=? ORDER BY id ASC',
-                            (deck_id, category)).fetchall()
+
+    cat_clause  = ' AND q.category=?' if category else ''
+    cat_params  = [category]              if category else []
+
+    if mode == 'weak':
+        # Attempted questions, lowest avg score first
+        sql  = f'''SELECT q.* FROM questions q
+                   JOIN attempts a ON a.question_id = q.id
+                   WHERE q.deck_id=? {cat_clause}
+                   GROUP BY q.id
+                   ORDER BY AVG(a.score) ASC'''
+        rows = conn.execute(sql, [deck_id] + cat_params).fetchall()
+    elif mode == 'new':
+        # Questions with zero attempts
+        sql  = f'''SELECT q.* FROM questions q
+                   WHERE q.deck_id=?
+                   AND q.id NOT IN (SELECT DISTINCT question_id FROM attempts)
+                   {cat_clause}'''
+        rows = conn.execute(sql, [deck_id] + cat_params).fetchall()
+        if shuffle:
+            import random; random.shuffle(rows := list(rows))
     else:
-        rows = conn.execute('SELECT * FROM questions WHERE deck_id=? ORDER BY id ASC', (deck_id,)).fetchall()
+        cat_sql = ' AND category=?' if category else ''
+        order   = ' ORDER BY RANDOM()' if shuffle else ' ORDER BY id ASC'
+        sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{order}'
+        rows = conn.execute(sql, [deck_id] + cat_params).fetchall()
+
     conn.close()
     result = []
     for r in rows:
         q = dict(r)
         q['key_points'] = json.loads(q['key_points'] or '[]')
         result.append(q)
-    if shuffle:
-        import random
-        random.shuffle(result)
     if limit:
         result = result[:limit]
     return jsonify(result)
