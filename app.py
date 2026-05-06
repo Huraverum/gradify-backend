@@ -982,6 +982,134 @@ def restore():
     conn.close()
     return jsonify({'ok': True})
 
+# ── Score inline (similar questions, no DB entry needed) ─────
+@app.route('/api/score-inline', methods=['POST'])
+def score_inline():
+    d          = request.get_json(force=True)
+    question   = (d.get('question') or '').strip()
+    model_ans  = (d.get('model_answer') or '').strip()
+    key_points = d.get('key_points', [])
+    answer     = (d.get('answer') or '').strip()
+    user_key   = d.get('api_key') or ANTHROPIC_API_KEY
+    if not answer:
+        return jsonify({'error': '回答を入力してください'}), 400
+    if not user_key:
+        return jsonify({'error': 'APIキーが未設定です'}), 401
+    kp_str = '\n'.join(f"- (w=2) {k['t']}" for k in key_points if isinstance(k, dict) and k.get('t'))
+    client = anthropic.Anthropic(api_key=user_key)
+    msg = client.messages.create(
+        model='claude-sonnet-4-6', max_tokens=2000, temperature=0,
+        system=SCORE_SYSTEM,
+        messages=[{'role':'user','content':
+            f"【問題】{question}\n\n【採点キーポイント】\n{kp_str}\n\n【受験者の回答】\n{answer}"}])
+    text = msg.content[0].text.strip()
+    try:
+        result = json.loads(text)
+    except Exception:
+        m = re.search(r'\{.*\}', text, re.DOTALL)
+        result = json.loads(m.group()) if m else {}
+    if not result:
+        return jsonify({'error': '採点結果の解析に失敗しました'}), 500
+    raw = result.get('score', 0)
+    result['score'] = min(100, round(40 + raw * 0.6))
+    grades = [('S',90),('A',75),('B',60),('C',40),('D',0)]
+    result['grade'] = next(g for g, t in grades if result['score'] >= t)
+    result['model_answer'] = model_ans
+    result['coins_earned'] = 0
+    return jsonify(result)
+
+# ── Weakness radar ───────────────────────────────────────────
+@app.route('/api/weakness-radar')
+def weakness_radar():
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT q.category,
+               COUNT(a.id)   AS attempt_count,
+               ROUND(AVG(a.score), 1) AS avg_score,
+               ROUND(SUM(CASE WHEN a.grade IN ('S','A') THEN 1 ELSE 0 END) * 100.0 / COUNT(a.id), 1) AS high_pct
+        FROM attempts a
+        JOIN questions q ON a.question_id = q.id
+        WHERE q.category IS NOT NULL AND q.category != ''
+        GROUP BY q.category
+        HAVING COUNT(a.id) >= 1
+        ORDER BY avg_score ASC
+    ''').fetchall()
+    conn.close()
+    return jsonify([dict(r) for r in rows])
+
+# ── Mistake cards ─────────────────────────────────────────────
+@app.route('/api/mistake-cards')
+def mistake_cards():
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT q.id, q.question, q.key_points, q.category,
+               ROUND(AVG(a.score), 1) AS avg_score,
+               MIN(a.grade) AS worst_grade,
+               COUNT(a.id)  AS attempt_count
+        FROM questions q
+        JOIN attempts a ON a.question_id = q.id
+        GROUP BY q.id
+        HAVING avg_score < 65
+        ORDER BY avg_score ASC
+        LIMIT 30
+    ''').fetchall()
+    conn.close()
+    cards = []
+    for r in rows:
+        try:
+            kps = json.loads(r['key_points'] or '[]')
+            key_text = ' / '.join(k['t'] for k in kps[:4] if isinstance(k, dict) and k.get('t'))
+        except Exception:
+            key_text = ''
+        cards.append({
+            'question_id':   r['id'],
+            'question':      r['question'],
+            'key_summary':   key_text,
+            'category':      r['category'] or '',
+            'avg_score':     r['avg_score'] or 0,
+            'worst_grade':   r['worst_grade'] or '?',
+            'attempt_count': r['attempt_count'],
+        })
+    return jsonify(cards)
+
+# ── Similar question ──────────────────────────────────────────
+@app.route('/api/questions/<int:qid>/similar', methods=['POST'])
+def similar_question(qid):
+    data    = request.get_json(force=True)
+    api_key = data.get('api_key', '')
+    conn    = get_db()
+    row     = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'error': '問題が見つかりません'}), 404
+    try:
+        kps = json.loads(row['key_points'] or '[]')
+        kp_text = '\n'.join(f'・{k["t"]}' for k in kps[:5] if isinstance(k, dict) and k.get('t'))
+    except Exception:
+        kp_text = row['model_answer'][:300]
+    client = anthropic.Anthropic(api_key=api_key)
+    prompt = f"""以下の記述式問題と類似した、同じ知識領域だが異なる切り口の問題を1つ作成してください。
+
+元の問題: {row['question']}
+カテゴリ: {row['category']}
+正解の要点:
+{kp_text}
+
+要件:
+- 同じ知識を問うが、問い方・状況設定・視点を変える
+- 記述式（選択肢なし）
+- 難易度は同程度
+- key_pointsは3〜5個
+
+必ずこのJSONのみを返してください（前後にテキスト不要）:
+{{"question":"問題文","model_answer":"模範解答（100字以内）","key_points":[{{"t":"要点1"}},{{"t":"要点2"}},{{"t":"要点3"}}],"category":"{row['category']}"}}"""
+    msg = client.messages.create(
+        model='claude-haiku-4-5-20251001', max_tokens=600,
+        messages=[{'role': 'user', 'content': prompt}])
+    raw    = msg.content[0].text.strip()
+    result = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+    return jsonify(result)
+
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
 def health():
