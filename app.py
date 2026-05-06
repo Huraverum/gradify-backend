@@ -461,9 +461,20 @@ NG_WORDS = [
     'パスワード','password','クレジット','カード番号',
 ]
 
+_PHONE_RE = re.compile(r'(\+?[\d\-\(\)\s]{10,20}\d)')
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
+
 def _contains_ng(text: str) -> bool:
     t = text.lower()
-    return any(re.search(ng.lower(), t) for ng in NG_WORDS)
+    if any(re.search(ng.lower(), t) for ng in NG_WORDS):
+        return True
+    if _EMAIL_RE.search(text):
+        return True
+    # 電話番号: 数字とハイフン・括弧だけで10文字以上連続
+    digits_only = re.sub(r'[\-\(\)\s\+]', '', text)
+    if re.search(r'\d{10,}', digits_only):
+        return True
+    return False
 
 @app.route('/api/ghost', methods=['POST'])
 def post_ghost():
