@@ -385,6 +385,57 @@ def upload_questions():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ── Stats API ─────────────────────────────────────────────────
+@app.route('/api/stats')
+def get_stats():
+    conn = get_db()
+    decks = conn.execute('SELECT * FROM decks').fetchall()
+    ADVANCE = {'S': 5, 'A': 4, 'B': 3, 'C': 2, 'D': 1}
+    GRADE_ORDER = ['S', 'A', 'B', 'C', 'D']
+    deck_stats = []
+    total_attempts = 0
+    total_score_sum = 0
+    board_pos = 0
+    for d in decks:
+        qids = [r['id'] for r in conn.execute(
+            'SELECT id FROM questions WHERE deck_id=?', (d['id'],)).fetchall()]
+        if not qids:
+            continue
+        ph = ','.join('?' * len(qids))
+        attempts = conn.execute(
+            f'SELECT score,grade FROM attempts WHERE question_id IN ({ph})', qids).fetchall()
+        if not attempts:
+            continue
+        count = len(attempts)
+        scores = [a['score'] for a in attempts]
+        grades = [a['grade'] for a in attempts]
+        avg = round(sum(scores) / count)
+        best = min(grades, key=lambda g: GRADE_ORDER.index(g) if g in GRADE_ORDER else 99)
+        accuracy = round(sum(1 for g in grades if g in ('S', 'A')) / count * 100)
+        pos_delta = sum(ADVANCE.get(g, 1) for g in grades)
+        total_attempts += count
+        total_score_sum += sum(scores)
+        board_pos += pos_delta
+        deck_stats.append({
+            'deck_id':      d['id'],
+            'deck_name':    d['name'],
+            'category':     d['category'] or '',
+            'attempt_count': count,
+            'avg_score':    avg,
+            'best_grade':   best,
+            'accuracy':     accuracy,
+            'grade_counts': {g: grades.count(g) for g in GRADE_ORDER},
+        })
+    conn.close()
+    board_pos = min(board_pos, 100)
+    return jsonify({
+        'board_pos':      board_pos,
+        'board_pct':      board_pos,
+        'total_attempts': total_attempts,
+        'avg_score':      round(total_score_sum / total_attempts) if total_attempts else 0,
+        'decks':          deck_stats,
+    })
+
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
 def health():
