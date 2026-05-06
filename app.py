@@ -160,6 +160,8 @@ def migrate_db():
 init_db()
 migrate_db()
 
+COIN_MAP = {'S': 50, 'A': 40, 'B': 30, 'C': 20, 'D': 10}
+
 # ── Scoring ───────────────────────────────────────────────────
 SCORE_SYSTEM = """あなたはAI採点官です。受験者の回答を加重採点し、模範解答も作成してください。必ず以下のJSON形式のみで返答してください。前後に余分なテキストや```json```などを含めないこと。
 
@@ -398,7 +400,6 @@ def score_sync():
     if not result:
         return jsonify({'error': '採点結果の解析に失敗しました'}), 500
 
-    COIN_MAP = {'S': 50, 'A': 40, 'B': 30, 'C': 20, 'D': 10}
     if answer.strip():
         raw = result.get('score', 0)
         result['score'] = min(100, round(40 + raw * 0.6))
@@ -803,27 +804,32 @@ def get_mcq(q_id):
 @app.route('/api/score-mcq', methods=['POST'])
 def score_mcq():
     d = request.get_json(force=True)
-    q_id   = int(d['question_id'])
+    q_id    = int(d['question_id'])
     correct = bool(d['correct'])
     conn = get_db()
     row = conn.execute('SELECT model_answer FROM questions WHERE id=?', (q_id,)).fetchone()
     if not row:
         conn.close()
         return jsonify({'error': 'not found'}), 404
+    conn.close()
     score = 100 if correct else 0
     grade = 'S' if correct else 'D'
     coins = COIN_MAP.get(grade, 10)
-    conn.execute('''INSERT INTO attempts
-        (question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at)
-        VALUES(?,?,?,?,?,'[]','[]','[]',?,?,datetime('now','localtime'))''',
-        (q_id, score, grade, '4択:正解' if correct else '4択:不正解',
-         row['model_answer'] or '',
-         '正解です！' if correct else '不正解。解説を確認しましょう。', ''))
-    conn.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (coins,))
-    conn.commit()
-    new_balance = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
-    conn.close()
-    return jsonify({'score': score, 'grade': grade, 'coins_earned': coins, 'balance': new_balance})
+    result = {
+        'score': score, 'grade': grade,
+        'model_answer': row['model_answer'] or '',
+        'covered': [], 'partial': [], 'missed': [],
+        'feedback': '正解です！' if correct else '不正解。解説を確認しましょう。',
+        'advice': '', 'coins_earned': coins,
+    }
+    _save_attempt(q_id, result, '4択:正解' if correct else '4択:不正解')
+    conn2 = get_db()
+    conn2.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (coins,))
+    conn2.commit()
+    new_balance = conn2.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    conn2.close()
+    result['balance'] = new_balance
+    return jsonify(result)
 
 # ── Backup / Restore ─────────────────────────────────────────
 @app.route('/api/backup')
