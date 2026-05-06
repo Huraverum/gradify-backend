@@ -98,6 +98,10 @@ def init_db():
         );
     ''')
     conn.execute('INSERT OR IGNORE INTO wallet(id, balance) VALUES(1, 0)')
+    # migration: add mcq_options column if missing
+    cols = [r['name'] for r in conn.execute('PRAGMA table_info(questions)').fetchall()]
+    if 'mcq_options' not in cols:
+        conn.execute('ALTER TABLE questions ADD COLUMN mcq_options TEXT DEFAULT NULL')
     conn.commit()
     conn.close()
 
@@ -742,6 +746,84 @@ def get_hint(q_id):
         'key_count': len(hints),
         'first_hint': hints[0] if hints else '',
     })
+
+# ── MCQ ──────────────────────────────────────────────────────
+@app.route('/api/questions/<int:q_id>/mcq')
+def get_mcq(q_id):
+    api_key = request.args.get('api_key', '') or ANTHROPIC_API_KEY
+    conn = get_db()
+    row = conn.execute('SELECT * FROM questions WHERE id=?', (q_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'not found'}), 404
+    if row['mcq_options']:
+        conn.close()
+        return jsonify(json.loads(row['mcq_options']))
+    if not api_key:
+        conn.close()
+        return jsonify({'error': 'api_key required'}), 400
+    import random
+    kps = json.loads(row['key_points'] or '[]')
+    answer_text = row['model_answer'] or '\n'.join(
+        f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
+    client = anthropic.Anthropic(api_key=api_key)
+    prompt = f"""以下の記述式問題と正解をもとに、4択選択肢を日本語で作成してください。
+
+問題: {row['question']}
+
+正解の要点:
+{answer_text[:600]}
+
+要件:
+- 選択肢は4つ（正解1つ＋紛らわしい誤答3つ）
+- 正解は模範解答の核心を1〜2文で簡潔にまとめる
+- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆など）
+- 各選択肢は30〜60字程度
+
+必ずこのJSONのみを返してください（前後にテキスト不要）:
+{{"options":["正解テキスト","誤答1","誤答2","誤答3"],"correct_index":0}}"""
+    try:
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001', max_tokens=600,
+            messages=[{'role': 'user', 'content': prompt}])
+        raw = msg.content[0].text.strip()
+        data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+        options = data['options']
+        correct = options[data['correct_index']]
+        random.shuffle(options)
+        result = {'options': options, 'correct_index': options.index(correct)}
+        conn.execute('UPDATE questions SET mcq_options=? WHERE id=?', (json.dumps(result), q_id))
+        conn.commit()
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
+    conn.close()
+    return jsonify(result)
+
+@app.route('/api/score-mcq', methods=['POST'])
+def score_mcq():
+    d = request.get_json(force=True)
+    q_id   = int(d['question_id'])
+    correct = bool(d['correct'])
+    conn = get_db()
+    row = conn.execute('SELECT model_answer FROM questions WHERE id=?', (q_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'not found'}), 404
+    score = 100 if correct else 0
+    grade = 'S' if correct else 'D'
+    coins = COIN_MAP.get(grade, 10)
+    conn.execute('''INSERT INTO attempts
+        (question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at)
+        VALUES(?,?,?,?,?,'[]','[]','[]',?,?,datetime('now','localtime'))''',
+        (q_id, score, grade, '4択:正解' if correct else '4択:不正解',
+         row['model_answer'] or '',
+         '正解です！' if correct else '不正解。解説を確認しましょう。', ''))
+    conn.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (coins,))
+    conn.commit()
+    new_balance = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    conn.close()
+    return jsonify({'score': score, 'grade': grade, 'coins_earned': coins, 'balance': new_balance})
 
 # ── Backup / Restore ─────────────────────────────────────────
 @app.route('/api/backup')
