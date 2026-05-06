@@ -131,6 +131,13 @@ def migrate_db():
         conn.commit()
     except Exception:
         pass
+    # 重複ghost_messagesを削除（同じsquare+messageの最古IDのみ残す）
+    conn.execute('''
+        DELETE FROM ghost_messages WHERE id NOT IN (
+            SELECT MIN(id) FROM ghost_messages GROUP BY square, message
+        )
+    ''')
+    conn.commit()
     # seed ghost messages if empty
     count = conn.execute('SELECT COUNT(*) FROM ghost_messages').fetchone()[0]
     if count == 0:
