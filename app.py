@@ -280,6 +280,23 @@ def get_categories(deck_id):
     conn.close()
     return jsonify([r['category'] for r in rows])
 
+@app.route('/api/questions/<int:q_id>', methods=['PUT'])
+def update_question(q_id):
+    d = request.get_json(force=True)
+    question = (d.get('question') or '').strip()
+    if not question:
+        return jsonify({'error': '問題文は必須です'}), 400
+    conn = get_db()
+    conn.execute(
+        'UPDATE questions SET category=?,question=?,model_answer=?,key_points=?,guideline_ref=?,flowchart=? WHERE id=?',
+        ((d.get('category') or '').strip(), question,
+         d.get('model_answer', ''),
+         json.dumps(d.get('key_points', []), ensure_ascii=False),
+         d.get('guideline_ref', ''), d.get('flowchart', ''), q_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
 @app.route('/api/questions/<int:q_id>', methods=['DELETE'])
 def delete_question(q_id):
     conn = get_db()
