@@ -680,6 +680,52 @@ def get_stats():
         'decks':          deck_stats,
     })
 
+# ── Backup / Restore ─────────────────────────────────────────
+@app.route('/api/backup')
+def backup():
+    conn = get_db()
+    data = {
+        'decks':          [dict(r) for r in conn.execute('SELECT * FROM decks').fetchall()],
+        'questions':      [dict(r) for r in conn.execute('SELECT * FROM questions').fetchall()],
+        'attempts':       [dict(r) for r in conn.execute('SELECT * FROM attempts').fetchall()],
+        'results':        [dict(r) for r in conn.execute('SELECT * FROM results').fetchall()],
+        'ghost_messages': [dict(r) for r in conn.execute('SELECT * FROM ghost_messages').fetchall()],
+    }
+    conn.close()
+    return jsonify(data)
+
+@app.route('/api/restore', methods=['POST'])
+def restore():
+    data = request.get_json(force=True)
+    conn = get_db()
+    for d in data.get('decks', []):
+        conn.execute(
+            'INSERT OR REPLACE INTO decks(id,name,description,category,created_at) VALUES(?,?,?,?,?)',
+            (d['id'], d['name'], d.get('description',''), d.get('category',''), d.get('created_at','')))
+    for q in data.get('questions', []):
+        conn.execute(
+            'INSERT OR REPLACE INTO questions(id,deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+            (q['id'], q['deck_id'], q.get('category',''), q['question'],
+             q.get('model_answer',''), q.get('key_points','[]'),
+             q.get('guideline_ref',''), q.get('flowchart',''), q.get('created_at','')))
+    for a in data.get('attempts', []):
+        conn.execute(
+            'INSERT OR REPLACE INTO attempts(id,question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+            (a['id'], a['question_id'], a['score'], a.get('grade',''),
+             a.get('answer',''), a.get('model_answer',''),
+             a.get('covered','[]'), a.get('partial','[]'), a.get('missed','[]'),
+             a.get('feedback',''), a.get('advice',''), a.get('attempted_at','')))
+    for r in data.get('results', []):
+        conn.execute(
+            'INSERT OR REPLACE INTO results(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+            (r['question_id'], r['score'], r.get('grade',''),
+             r.get('answer',''), r.get('model_answer',''),
+             r.get('covered','[]'), r.get('partial','[]'), r.get('missed','[]'),
+             r.get('feedback',''), r.get('advice',''), r.get('saved_at','')))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
 def health():
