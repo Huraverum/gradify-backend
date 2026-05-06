@@ -459,16 +459,29 @@ NG_WORDS = [
     # その他問題ワード
     '薬物','覚醒剤','大麻','マリファナ','麻薬','drug',
     'パスワード','password','クレジット','カード番号',
+    # SNS・連絡先誘導
+    'line id','line@','lineID','ラインID','ラインid',
+    '@gmail','@yahoo','@icloud','@hotmail','@outlook',
+    'discord','discordid','discord.gg',
+    'telegram','テレグラム',
+    'wechat','ウィーチャット','微信',
+    'kakao','カカオ',
+    'snapchat','スナチャ',
+    'skype','スカイプ',
+    'dm送','dm下さい','連絡ください','連絡して','連絡先',
+    'id教え','id送','アカウント教え',
 ]
 
-_PHONE_RE = re.compile(r'(\+?[\d\-\(\)\s]{10,20}\d)')
-_EMAIL_RE = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
+_EMAIL_RE   = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
+_ACCOUNT_RE = re.compile(r'@[a-zA-Z0-9_.]{3,}')  # @username 形式のアカウントID
 
 def _contains_ng(text: str) -> bool:
     t = text.lower()
     if any(re.search(ng.lower(), t) for ng in NG_WORDS):
         return True
     if _EMAIL_RE.search(text):
+        return True
+    if _ACCOUNT_RE.search(text):
         return True
     # 電話番号: 数字とハイフン・括弧だけで10文字以上連続
     digits_only = re.sub(r'[\-\(\)\s\+]', '', text)
