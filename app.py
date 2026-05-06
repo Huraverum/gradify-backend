@@ -475,6 +475,16 @@ NG_WORDS = [
 _EMAIL_RE   = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z]{2,}')
 _ACCOUNT_RE = re.compile(r'@[a-zA-Z0-9_.]{3,}')  # @username 形式のアカウントID
 
+# 薬物隠語（食べ物系）— 取引ワードと組み合わせた時のみブロック
+_DRUG_SLANG  = ['アイス', 'トマト', 'ブロッコリー', 'バナナ', 'シャブ', 'ヤク']
+_DEAL_WORDS  = ['買', '売', '譲', '入手', '取引', '仕入', '注文', 'ください', '欲しい',
+                'どこで', '値段', '円', '個', 'グラム', 'g ', '連絡', 'dm', 'DM']
+
+def _contains_drug_slang_combo(text: str) -> bool:
+    has_slang = any(s in text for s in _DRUG_SLANG)
+    has_deal  = any(d in text for d in _DEAL_WORDS)
+    return has_slang and has_deal
+
 def _contains_ng(text: str) -> bool:
     t = text.lower()
     if any(re.search(ng.lower(), t) for ng in NG_WORDS):
@@ -486,6 +496,8 @@ def _contains_ng(text: str) -> bool:
     # 電話番号: 数字とハイフン・括弧だけで10文字以上連続
     digits_only = re.sub(r'[\-\(\)\s\+]', '', text)
     if re.search(r'\d{10,}', digits_only):
+        return True
+    if _contains_drug_slang_combo(text):
         return True
     return False
 
