@@ -156,14 +156,18 @@ SCORE_SYSTEM = """あなたはAI採点官です。受験者の回答を加重採
 
 【採点手順】
 1. 「採点キーポイント」に列挙された各項目を一つずつ確認する。
-2. 各キーポイントについて、受験者の回答が「完全に網羅（100%）」「部分的に正解（50%）」「未回答・誤答（0%）」のどれかを判定する。
-3. 判定に基づき、そのキーポイントの文言を以下のいずれかに振り分ける：
-   - covered（完全網羅）: キーポイントの文言をそのまま記載
-   - partial（部分正解）: キーポイントの文言をそのまま記載
-   - missed（未回答・誤答）: キーポイントの文言をそのまま記載
-4. スコア計算：重み w=3→15点満点, w=2→10点満点, w=1→5点満点。達成率×満点を合計し、総満点で割って100点換算。
+2. 各キーポイントについて、受験者の回答を以下の基準で厳密に判定する：
+   - covered（100%）: キーポイントの核心的な内容・キーワードが明確に述べられている
+   - partial（50%）: キーポイントの概念に触れているが、重要な詳細・数値・具体的な語句が欠けている
+   - missed（0%）: 全く言及がない、または内容が誤っている
+3. 判定に基づき、そのキーポイントの文言をそのまま covered/partial/missed のいずれかに振り分ける。
+4. スコア計算：重み w=3→15点満点, w=2→10点満点, w=1→5点満点。covered=達成率100%, partial=50%, missed=0%。各キーポイントのスコアを合算し、総満点で割って100点換算する。
 
-【出力形式】covered/partial/missedには必ずキーポイントの実際の文言を入れること（「なし」「該当なし」は不可）。
+【判定ルール】
+- 迷った場合は partial ではなく missed を選ぶ（部分点は明確に触れている場合のみ）
+- キーワードの言い換えが正確なら covered、曖昧なら partial
+- covered/partial/missed のどれかに必ず全キーポイントを分類すること
+- covered/partial/missed には必ずキーポイントの実際の文言を入れること（「なし」「該当なし」は不可）
 
 {"score":整数0-100,"grade":"S/A/B/C/D","covered":["完全に網羅できたキーポイントの文言"],"partial":["部分的にしか触れていないキーポイントの文言"],"missed":["全く触れていない・誤ったキーポイントの文言"],"feedback":"総合フィードバック（3文）","advice":"今後の学習アドバイス（1-2文）","model_answer":"模範解答（400字程度）"}
 
@@ -291,6 +295,7 @@ def score():
         with client.messages.stream(
             model='claude-sonnet-4-6',
             max_tokens=2000,
+            temperature=0,
             system=SCORE_SYSTEM,
             messages=[{'role':'user','content':
                 f"【問題】{row['question']}\n\n【採点キーポイント】\n{kp_str}\n\n【受験者の回答】\n{answer}"}]
@@ -332,6 +337,7 @@ def score_sync():
     msg = client.messages.create(
         model='claude-sonnet-4-6',
         max_tokens=2000,
+        temperature=0,
         system=SCORE_SYSTEM,
         messages=[{'role':'user','content':
             f"【問題】{row['question']}\n\n【採点キーポイント】\n{kp_str}\n\n【受験者の回答】\n{answer}"}]
