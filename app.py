@@ -166,6 +166,7 @@ SCORE_SYSTEM = """あなたはAI採点官です。受験者の回答を加重採
 【判定ルール】
 - 迷った場合は必ず partial を選ぶ。missed は「完全に無言及」または「明らかに誤り」の場合のみ
 - キーワードが正確なら covered、少しでも関連していれば partial、全く無関係・誤りのみ missed
+- 【音声入力救済】回答は音声認識による誤字を含む場合がある。同音異義語・類似音の置換（例:「乳腺」→「乳線」「にゅうせん」、「腫瘍」→「種瘍」、漢数字↔アラビア数字）が疑われるときは意味が通じれば covered として扱う
 - covered/partial/missed のどれかに必ず全キーポイントを分類すること
 - covered/partial/missed には必ずキーポイントの実際の文言を入れること（「なし」「該当なし」は不可）
 
@@ -388,6 +389,11 @@ def score_sync():
     if not result:
         return jsonify({'error': '採点結果の解析に失敗しました'}), 500
 
+    if answer.strip():
+        raw = result.get('score', 0)
+        result['score'] = min(100, round(40 + raw * 0.6))
+        grades = [('S',90),('A',75),('B',60),('C',40),('D',0)]
+        result['grade'] = next(g for g, t in grades if result['score'] >= t)
     _save_attempt(qid, result, answer)
     return jsonify(result)
 
@@ -611,6 +617,14 @@ def post_ghost():
 def like_ghost(msg_id):
     conn = get_db()
     conn.execute('UPDATE ghost_messages SET likes=likes+1 WHERE id=?', (msg_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/ghost/<int:msg_id>/seal', methods=['POST'])
+def seal_ghost(msg_id):
+    conn = get_db()
+    conn.execute('DELETE FROM ghost_messages WHERE id=?', (msg_id,))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
