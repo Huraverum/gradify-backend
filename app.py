@@ -890,6 +890,38 @@ def score_mcq():
     result['balance'] = new_balance
     return jsonify(result)
 
+# ── Companion reaction ───────────────────────────────────────
+COMPANION_SYSTEM = """あなたは旅の仲間の小動物です。プレイヤーの言葉に対して1〜2文で短く反応してください。
+
+キャラクター:
+- 好奇心旺盛で忠実、時々ちょっとズレた反応をする
+- 勉強・挑戦には熱く背中を押す
+- 休憩・遊びには少し心配しつつも応援する
+- 驚いたり、予想外のことには大げさに反応する
+- 語尾は「〜だよ」「〜かな」「〜！」などかわいい話し言葉
+- 絵文字は使わない
+- 返答はかならず1〜2文のみ"""
+
+@app.route('/api/companion/react', methods=['POST'])
+def companion_react():
+    d = request.get_json(force=True)
+    player_input = (d.get('player_input') or '').strip()
+    api_key = d.get('api_key') or ANTHROPIC_API_KEY
+    if not player_input:
+        return jsonify({'error': 'player_input required'}), 400
+    if not api_key:
+        return jsonify({'error': 'api_key required'}), 401
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=120,
+            system=COMPANION_SYSTEM,
+            messages=[{'role': 'user', 'content': player_input}])
+        return jsonify({'reaction': msg.content[0].text.strip()})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ── Backup / Restore ─────────────────────────────────────────
 @app.route('/api/backup')
 def backup():
