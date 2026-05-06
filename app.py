@@ -207,14 +207,26 @@ def delete_deck(deck_id):
 # ── Question API ──────────────────────────────────────────────
 @app.route('/api/decks/<int:deck_id>/questions', methods=['GET'])
 def get_questions(deck_id):
+    category = request.args.get('category', '')
+    limit    = request.args.get('limit', type=int)
+    shuffle  = request.args.get('shuffle', '0') == '1'
     conn = get_db()
-    rows = conn.execute('SELECT * FROM questions WHERE deck_id=? ORDER BY id ASC', (deck_id,)).fetchall()
+    if category:
+        rows = conn.execute('SELECT * FROM questions WHERE deck_id=? AND category=? ORDER BY id ASC',
+                            (deck_id, category)).fetchall()
+    else:
+        rows = conn.execute('SELECT * FROM questions WHERE deck_id=? ORDER BY id ASC', (deck_id,)).fetchall()
     conn.close()
     result = []
     for r in rows:
         q = dict(r)
         q['key_points'] = json.loads(q['key_points'] or '[]')
         result.append(q)
+    if shuffle:
+        import random
+        random.shuffle(result)
+    if limit:
+        result = result[:limit]
     return jsonify(result)
 
 @app.route('/api/decks/<int:deck_id>/questions', methods=['POST'])
@@ -234,6 +246,15 @@ def add_question(deck_id):
     conn.commit()
     conn.close()
     return jsonify({'ok': True, 'id': cur.lastrowid})
+
+@app.route('/api/decks/<int:deck_id>/categories')
+def get_categories(deck_id):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT DISTINCT category FROM questions WHERE deck_id=? AND category IS NOT NULL AND category!='' ORDER BY category",
+        (deck_id,)).fetchall()
+    conn.close()
+    return jsonify([r['category'] for r in rows])
 
 @app.route('/api/questions/<int:q_id>', methods=['DELETE'])
 def delete_question(q_id):
