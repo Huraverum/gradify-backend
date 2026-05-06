@@ -770,7 +770,7 @@ def get_mcq(q_id):
     answer_text = row['model_answer'] or '\n'.join(
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
     client = anthropic.Anthropic(api_key=api_key)
-    prompt = f"""以下の記述式問題と正解をもとに、4択選択肢を日本語で作成してください。
+    prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
 問題: {row['question']}
 
@@ -778,16 +778,16 @@ def get_mcq(q_id):
 {answer_text[:600]}
 
 要件:
-- 選択肢は4つ（正解1つ＋紛らわしい誤答3つ）
+- 選択肢は5つ（正解1つ＋紛らわしい誤答4つ）
 - 正解は模範解答の核心を1〜2文で簡潔にまとめる
-- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆など）
+- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト","誤答1","誤答2","誤答3"],"correct_index":0}}"""
+{{"options":["正解テキスト","誤答1","誤答2","誤答3","誤答4"],"correct_index":0}}"""
     try:
         msg = client.messages.create(
-            model='claude-haiku-4-5-20251001', max_tokens=600,
+            model='claude-haiku-4-5-20251001', max_tokens=800,
             messages=[{'role': 'user', 'content': prompt}])
         raw = msg.content[0].text.strip()
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
@@ -802,6 +802,16 @@ def get_mcq(q_id):
         return jsonify({'error': str(e)}), 500
     conn.close()
     return jsonify(result)
+
+@app.route('/api/mcq/clear-cache', methods=['POST'])
+def clear_mcq_cache():
+    """mcq_options を全てNULLにリセット（択数変更時などに使用）。"""
+    conn = get_db()
+    conn.execute('UPDATE questions SET mcq_options=NULL')
+    conn.commit()
+    count = conn.execute('SELECT COUNT(*) FROM questions').fetchone()[0]
+    conn.close()
+    return jsonify({'ok': True, 'cleared': count})
 
 @app.route('/api/mcq/generate-all', methods=['POST'])
 def generate_all_mcq():
@@ -825,7 +835,7 @@ def generate_all_mcq():
         kps = json.loads(row['key_points'] or '[]')
         answer_text = row['model_answer'] or '\n'.join(
             f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
-        prompt = f"""以下の記述式問題と正解をもとに、4択選択肢を日本語で作成してください。
+        prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
 問題: {row['question']}
 
@@ -833,16 +843,16 @@ def generate_all_mcq():
 {answer_text[:600]}
 
 要件:
-- 選択肢は4つ（正解1つ＋紛らわしい誤答3つ）
+- 選択肢は5つ（正解1つ＋紛らわしい誤答4つ）
 - 正解は模範解答の核心を1〜2文で簡潔にまとめる
-- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆など）
+- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト","誤答1","誤答2","誤答3"],"correct_index":0}}"""
+{{"options":["正解テキスト","誤答1","誤答2","誤答3","誤答4"],"correct_index":0}}"""
         try:
             msg = client.messages.create(
-                model='claude-haiku-4-5-20251001', max_tokens=600,
+                model='claude-haiku-4-5-20251001', max_tokens=800,
                 messages=[{'role': 'user', 'content': prompt}])
             raw = msg.content[0].text.strip()
             data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
@@ -881,7 +891,7 @@ def score_mcq():
         'feedback': '正解です！' if correct else '不正解。解説を確認しましょう。',
         'advice': '', 'coins_earned': coins,
     }
-    _save_attempt(q_id, result, '4択:正解' if correct else '4択:不正解')
+    _save_attempt(q_id, result, '5択:正解' if correct else '5択:不正解')
     conn2 = get_db()
     conn2.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (coins,))
     conn2.commit()

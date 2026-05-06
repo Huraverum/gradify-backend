@@ -40,7 +40,7 @@ for i, row in enumerate(rows, 1):
     kps = json.loads(row['key_points'] or '[]')
     answer_text = row['model_answer'] or '\n'.join(
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
-    prompt = f"""以下の記述式問題と正解をもとに、4択選択肢を日本語で作成してください。
+    prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
 問題: {row['question']}
 
@@ -48,16 +48,16 @@ for i, row in enumerate(rows, 1):
 {answer_text[:600]}
 
 要件:
-- 選択肢は4つ（正解1つ＋紛らわしい誤答3つ）
+- 選択肢は5つ（正解1つ＋紛らわしい誤答4つ）
 - 正解は模範解答の核心を1〜2文で簡潔にまとめる
-- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆など）
+- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト","誤答1","誤答2","誤答3"],"correct_index":0}}"""
+{{"options":["正解テキスト","誤答1","誤答2","誤答3","誤答4"],"correct_index":0}}"""
     try:
         msg = client.messages.create(
-            model='claude-haiku-4-5-20251001', max_tokens=600,
+            model='claude-haiku-4-5-20251001', max_tokens=800,
             messages=[{'role': 'user', 'content': prompt}])
         raw = msg.content[0].text.strip()
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
