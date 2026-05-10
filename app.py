@@ -96,6 +96,13 @@ def init_db():
             id INTEGER PRIMARY KEY CHECK(id=1),
             balance INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS achievement_unlocks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            achievement_id TEXT NOT NULL,
+            user_token TEXT NOT NULL,
+            unlocked_at TEXT DEFAULT (datetime('now','localtime')),
+            UNIQUE(achievement_id, user_token)
+        );
     ''')
     conn.execute('INSERT OR IGNORE INTO wallet(id, balance) VALUES(1, 0)')
     # migration: add mcq_options column if missing
@@ -113,9 +120,9 @@ GHOST_SEEDS = [
     (10, "第一関門を越えた者へ。この先はもっと険しい。だが、越えられる。", "先人"),
     (13, "十三という数字が不吉だと思っていた。でも何も起きなかった。", "文系浪人"),
     (15, "折り返しの半分。まだ半分。どちらで見るかで全てが変わる。", "哲学科の学生"),
-    (20, "五分の一。あの頃はこの数字が遠かった。", "再挑戦中の旅人"),
-    (25, "四分の一到達。ここで止まった仲間がいた。あなたは違う。", "元受験生"),
-    (30, "三十マス。疲れただろう。少し休め。でも戻ってこい。", "OB"),
+    (20, "二つ目の関門を越えた。ここから先は頂上だけを見ろ。", "再挑戦中の旅人"),
+    (25, "あと五マス。合格の二文字が見えるか？", "元受験生"),
+    (30, "おめでとう。ここまで来た者だけが知っている景色がある。", "ゴールの向こうから"),
     (33, "人生の三分の一に似た数字。まだ何でもできる。", "社会人受験生"),
     (40, "十分の四。誰かが「ここが本当の始まり」と言っていた。", "予備校講師"),
     (42, "宇宙の答えは42だと聞いた。あなたの答えは何マス先にある？", "理系の誰か"),
@@ -370,6 +377,7 @@ def score_sync():
     qid      = d.get('question_id')
     answer   = (d.get('answer') or '').strip()
     user_key = d.get('api_key') or ANTHROPIC_API_KEY
+    companion = d.get('companion')
     if not answer:
         return jsonify({'error': '回答を入力してください'}), 400
     if not user_key:
@@ -404,7 +412,8 @@ def score_sync():
 
     if answer.strip():
         raw = result.get('score', 0)
-        result['score'] = min(100, round(40 + raw * 0.6))
+        base = 45 if companion == 'dragon' else 40
+        result['score'] = min(100, round(base + raw * 0.6))
         grades = [('S',90),('A',75),('B',60),('C',40),('D',0)]
         result['grade'] = next(g for g, t in grades if result['score'] >= t)
         earned = COIN_MAP.get(result['grade'], 10)
@@ -690,10 +699,13 @@ def get_stats():
             'grade_counts': {g: grades.count(g) for g in GRADE_ORDER},
         })
     conn.close()
-    board_pos = min(board_pos, 100)
+    raw_board_pos = board_pos
+    board_total = 300
+    board_pos = min(board_pos, board_total)
     return jsonify({
         'board_pos':      board_pos,
-        'board_pct':      board_pos,
+        'board_pct':      round(board_pos / board_total * 100),
+        'raw_board_pos':  raw_board_pos,
         'total_attempts': total_attempts,
         'avg_score':      round(total_score_sum / total_attempts) if total_attempts else 0,
         'decks':          deck_stats,
@@ -734,6 +746,70 @@ def earn_wallet():
     conn.close()
     return jsonify({'balance': new_balance})
 
+@app.route('/api/murmur-fragments')
+def murmur_fragments():
+    """病的モード用：問題文・キーポイントからランダムな断片を返す"""
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT question, key_points FROM questions ORDER BY RANDOM() LIMIT 30'
+    ).fetchall()
+    conn.close()
+    fragments = []
+    import json as _json
+    for r in rows:
+        # 問題文の先頭20〜30文字
+        q = (r['question'] or '').strip()
+        if len(q) >= 6:
+            end = min(len(q), 22)
+            fragments.append(q[:end] + '…')
+        # キーポイントから最初の項目
+        kp = r['key_points']
+        if kp:
+            try:
+                pts = _json.loads(kp)
+                if isinstance(pts, list) and pts:
+                    t = (pts[0].get('t') or '').strip()
+                    if len(t) >= 4:
+                        fragments.append(t[:20] + '…' if len(t) > 20 else t)
+            except Exception:
+                pass
+    import random
+    random.shuffle(fragments)
+    return jsonify(fragments[:20])
+
+@app.route('/api/achievements/unlock', methods=['POST'])
+def unlock_achievements():
+    d = request.get_json(force=True)
+    user_token = d.get('user_token', '')
+    ids = d.get('achievement_ids', [])
+    if not user_token or not ids:
+        return jsonify({'ok': False}), 400
+    conn = get_db()
+    for aid in ids:
+        conn.execute(
+            'INSERT OR IGNORE INTO achievement_unlocks(achievement_id, user_token) VALUES(?,?)',
+            (aid, user_token)
+        )
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/achievements/rarity')
+def achievement_rarity():
+    conn = get_db()
+    total_users = conn.execute(
+        'SELECT COUNT(DISTINCT user_token) FROM achievement_unlocks'
+    ).fetchone()[0]
+    if total_users == 0:
+        conn.close()
+        return jsonify({})
+    rows = conn.execute(
+        'SELECT achievement_id, COUNT(DISTINCT user_token) as cnt FROM achievement_unlocks GROUP BY achievement_id'
+    ).fetchall()
+    conn.close()
+    result = {r['achievement_id']: round(r['cnt'] / total_users * 100) for r in rows}
+    return jsonify(result)
+
 @app.route('/api/questions/<int:q_id>/hint')
 def get_hint(q_id):
     conn = get_db()
@@ -760,8 +836,13 @@ def get_mcq(q_id):
         conn.close()
         return jsonify({'error': 'not found'}), 404
     if row['mcq_options']:
-        conn.close()
-        return jsonify(json.loads(row['mcq_options']))
+        try:
+            cached = json.loads(row['mcq_options'])
+            if len(cached.get('options', [])) == 5:
+                conn.close()
+                return jsonify(cached)
+        except Exception:
+            pass
     if not api_key:
         conn.close()
         return jsonify({'error': 'api_key required'}), 400
@@ -792,6 +873,8 @@ def get_mcq(q_id):
         raw = msg.content[0].text.strip()
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
         options = data['options']
+        if len(options) != 5:
+            raise ValueError('MCQ options must contain exactly 5 choices')
         correct = options[data['correct_index']]
         random.shuffle(options)
         result = {'options': options, 'correct_index': options.index(correct)}
@@ -943,44 +1026,48 @@ def backup():
         'results':        [dict(r) for r in conn.execute('SELECT * FROM results').fetchall()],
         'ghost_messages': [dict(r) for r in conn.execute('SELECT * FROM ghost_messages').fetchall()],
         'wallet':         [dict(r) for r in conn.execute('SELECT * FROM wallet').fetchall()],
+        'achievement_unlocks': [dict(r) for r in conn.execute('SELECT * FROM achievement_unlocks').fetchall()],
     }
     conn.close()
     return jsonify(data)
 
+def _table_cols(conn, table):
+    return [r['name'] for r in conn.execute(f'PRAGMA table_info({table})').fetchall()]
+
+def _insert_replace_row(conn, table, row):
+    cols = [c for c in _table_cols(conn, table) if c in row]
+    if not cols:
+        return
+    placeholders = ','.join(['?'] * len(cols))
+    sql = f"INSERT OR REPLACE INTO {table}({','.join(cols)}) VALUES({placeholders})"
+    conn.execute(sql, [row.get(c) for c in cols])
+
 @app.route('/api/restore', methods=['POST'])
 def restore():
-    data = request.get_json(force=True)
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({'error': 'バックアップJSONを読み取れません'}), 400
+    if not isinstance(data, dict):
+        return jsonify({'error': 'バックアップ形式が不正です'}), 400
     conn = get_db()
-    for d in data.get('decks', []):
-        conn.execute(
-            'INSERT OR REPLACE INTO decks(id,name,description,category,created_at) VALUES(?,?,?,?,?)',
-            (d['id'], d['name'], d.get('description',''), d.get('category',''), d.get('created_at','')))
-    for q in data.get('questions', []):
-        conn.execute(
-            'INSERT OR REPLACE INTO questions(id,deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-            (q['id'], q['deck_id'], q.get('category',''), q['question'],
-             q.get('model_answer',''), q.get('key_points','[]'),
-             q.get('guideline_ref',''), q.get('flowchart',''), q.get('created_at','')))
-    for a in data.get('attempts', []):
-        conn.execute(
-            'INSERT OR REPLACE INTO attempts(id,question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-            (a['id'], a['question_id'], a['score'], a.get('grade',''),
-             a.get('answer',''), a.get('model_answer',''),
-             a.get('covered','[]'), a.get('partial','[]'), a.get('missed','[]'),
-             a.get('feedback',''), a.get('advice',''), a.get('attempted_at','')))
-    for r in data.get('results', []):
-        conn.execute(
-            'INSERT OR REPLACE INTO results(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-            (r['question_id'], r['score'], r.get('grade',''),
-             r.get('answer',''), r.get('model_answer',''),
-             r.get('covered','[]'), r.get('partial','[]'), r.get('missed','[]'),
-             r.get('feedback',''), r.get('advice',''), r.get('saved_at','')))
-    for w in data.get('wallet', []):
-        conn.execute('INSERT OR REPLACE INTO wallet(id, balance) VALUES(?,?)',
-            (w['id'], w['balance']))
-    conn.commit()
-    conn.close()
-    return jsonify({'ok': True})
+    try:
+        for table in ['decks', 'questions', 'attempts', 'results', 'ghost_messages', 'wallet', 'achievement_unlocks']:
+            rows = data.get(table, [])
+            if rows is None:
+                continue
+            if not isinstance(rows, list):
+                return jsonify({'error': f'{table} の形式が不正です'}), 400
+            for row in rows:
+                if isinstance(row, dict):
+                    _insert_replace_row(conn, table, row)
+        conn.commit()
+        return jsonify({'ok': True})
+    except Exception as e:
+        conn.rollback()
+        return jsonify({'error': f'復元に失敗しました: {e}'}), 500
+    finally:
+        conn.close()
 
 # ── Score inline (similar questions, no DB entry needed) ─────
 @app.route('/api/score-inline', methods=['POST'])
@@ -991,6 +1078,7 @@ def score_inline():
     key_points = d.get('key_points', [])
     answer     = (d.get('answer') or '').strip()
     user_key   = d.get('api_key') or ANTHROPIC_API_KEY
+    companion  = d.get('companion')
     if not answer:
         return jsonify({'error': '回答を入力してください'}), 400
     if not user_key:
@@ -1011,7 +1099,8 @@ def score_inline():
     if not result:
         return jsonify({'error': '採点結果の解析に失敗しました'}), 500
     raw = result.get('score', 0)
-    result['score'] = min(100, round(40 + raw * 0.6))
+    base = 45 if companion == 'dragon' else 40
+    result['score'] = min(100, round(base + raw * 0.6))
     grades = [('S',90),('A',75),('B',60),('C',40),('D',0)]
     result['grade'] = next(g for g, t in grades if result['score'] >= t)
     result['model_answer'] = model_ans
