@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>サポート | ライバルに差をつけろ</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', sans-serif;
+      max-width: 720px; margin: 0 auto; padding: 24px 20px 80px; line-height: 1.75;
+      color: #1f2937; background: #f8fafc;
+    }
+    @media (prefers-color-scheme: dark) {
+      body { color: #e5e7eb; background: #0f172a; }
+      h1, h2 { color: #f1f5f9; }
+      a { color: #60a5fa; }
+      .meta { color: #94a3b8; }
+      .box { background: #1e293b; border-color: #334155; }
+      .faq summary { background: #1e293b; }
+    }
+    h1 { font-size: 24px; border-bottom: 2px solid #60a5fa; padding-bottom: 8px; }
+    h2 { font-size: 17px; margin-top: 28px; }
+    .meta { font-size: 12px; color: #64748b; margin-bottom: 24px; }
+    .box {
+      background: #fff; border: 1px solid #e2e8f0; border-radius: 10px;
+      padding: 14px 18px; margin: 16px 0; font-size: 14px;
+    }
+    .faq { margin: 12px 0; }
+    .faq summary {
+      cursor: pointer; padding: 12px 14px; background: #fff;
+      border: 1px solid #e2e8f0; border-radius: 8px; font-weight: 600;
+    }
+    .faq[open] summary { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
+    .faq-body { padding: 12px 14px; border: 1px solid #e2e8f0; border-top: 0;
+                border-bottom-left-radius: 8px; border-bottom-right-radius: 8px; }
+  </style>
+</head>
+<body>
+  <h1>サポート</h1>
+  <p class="meta">アプリ名：ライバルに差をつけろ（gradify）</p>
+
+  <p>本アプリのご利用について、お困りの際は下記をご確認ください。</p>
+
+  <h2>お問い合わせ</h2>
+  <div class="box">
+    開発者：huraverum<br>
+    連絡先：<a href="mailto:brigantin51@gmail.com">brigantin51@gmail.com</a><br>
+    回答までに数日いただく場合があります。
+  </div>
+
+  <h2>よくある質問</h2>
+
+  <details class="faq">
+    <summary>初回起動時に「接続できません」と表示される</summary>
+    <div class="faq-body">
+      バックエンドサーバーのURLが正しく入力されているかご確認ください。
+      URLは <code>https://</code> から始まる完全な形式で入力してください。
+    </div>
+  </details>
+
+  <details class="faq">
+    <summary>採点結果が返ってこない</summary>
+    <div class="faq-body">
+      AI採点には数秒～十数秒かかる場合があります。ネットワーク状況をご確認の上、
+      時間を置いて再度お試しください。それでも解消しない場合は、APIキーの設定をご確認ください。
+    </div>
+  </details>
+
+  <details class="faq">
+    <summary>データを削除したい</summary>
+    <div class="faq-body">
+      <strong>ローカルデータ：</strong>設定タブの「設定をリセット」、またはアプリを削除することで、
+      端末内のすべてのデータが消去されます。<br>
+      <strong>サーバーデータ：</strong>上記連絡先までメールでご連絡ください。
+    </div>
+  </details>
+
+  <details class="faq">
+    <summary>バックアップを取りたい</summary>
+    <div class="faq-body">
+      設定タブの「バックアップを保存・共有」から、すべての学習データをJSONファイルとして書き出せます。
+      別端末や復元時には「バックアップから復元」をご利用ください。
+    </div>
+  </details>
+
+  <details class="faq">
+    <summary>APIキーは安全に保管されますか</summary>
+    <div class="faq-body">
+      入力されたAPIキーは、端末内のセキュアストレージに保存され、外部サーバーには送信されません。
+      アプリを削除するとAPIキーも削除されます。
+    </div>
+  </details>
+
+  <h2>関連リンク</h2>
+  <ul>
+    <li><a href="/privacy">プライバシーポリシー</a></li>
+  </ul>
+
+  <p class="meta" style="margin-top: 40px; text-align: center;">
+    © 2026 huraverum. All rights reserved.
+  </p>
+</body>
+</html>

@@ -1204,5 +1204,25 @@ def similar_question(qid):
 def health():
     return jsonify({'status': 'ok', 'version': '1.0.0'})
 
+# ── Legal pages ───────────────────────────────────────────────
+LEGAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'legal')
+
+def _serve_legal(filename: str):
+    path = os.path.join(LEGAL_DIR, filename)
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            html = f.read()
+        return Response(html, mimetype='text/html; charset=utf-8')
+    except FileNotFoundError:
+        return Response('Not Found', status=404)
+
+@app.route('/privacy')
+def privacy():
+    return _serve_legal('privacy.html')
+
+@app.route('/support')
+def support():
+    return _serve_legal('support.html')
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=PORT, debug=False)
