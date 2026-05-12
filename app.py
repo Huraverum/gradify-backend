@@ -1199,6 +1199,24 @@ def similar_question(qid):
     result = json.loads(re.search(r'\{.*\}', raw, re.S).group())
     return jsonify(result)
 
+# ── Wipe all user data ────────────────────────────────────────
+@app.route('/api/wipe', methods=['POST'])
+def wipe_all():
+    d = request.get_json(silent=True) or {}
+    if d.get('confirm') != 'DELETE_ALL_DATA':
+        return jsonify({'error': 'confirmation token required'}), 400
+    conn = get_db()
+    counts = {}
+    for table in ('attempts', 'results', 'questions', 'decks',
+                  'ghost_messages', 'achievement_unlocks'):
+        row = conn.execute(f'SELECT COUNT(*) AS n FROM {table}').fetchone()
+        counts[table] = row['n']
+        conn.execute(f'DELETE FROM {table}')
+    conn.execute('UPDATE wallet SET balance=0 WHERE id=1')
+    conn.commit()
+    conn.close()
+    return jsonify({'status': 'ok', 'deleted': counts})
+
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
 def health():
