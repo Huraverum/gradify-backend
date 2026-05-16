@@ -961,9 +961,9 @@ def get_mcq(q_id):
     answer_text = row['model_answer'] or '\n'.join(
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
     client = anthropic.Anthropic(api_key=api_key)
-    correct_rule = '正解は必ず2つ。2つとも同時に選ぶべき正解にする' if requested_count == 2 else (
-        '正解は必ず1つ' if requested_count == 1 else
-        '正解は1つまたは2つ。2つ正解にできる問題では、同時に選ぶべき正解を2つ作る'
+    correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる' if requested_count == 2 else (
+        '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
+        '設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる'
     )
     prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
@@ -975,12 +975,14 @@ def get_mcq(q_id):
 要件:
 - 選択肢は5つ
 - {correct_rule}
-- 正解は模範解答の核心を1〜2文で簡潔にまとめる
-- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
+- correct_indices は「設問への答えとして選ぶべき選択肢」の番号にする
+- 問題文が「誤り」「適切でない」「最も適切でない」などを問う場合は、誤っている／適切でない選択肢を correct_indices に入れる
+- correct_indices に入れる選択肢は模範解答の核心を1〜2文で簡潔に反映する
+- correct_indices 以外の選択肢は、それぞれ異なる方向の非該当選択肢にする
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト1","正解テキスト2または誤答","誤答1","誤答2","誤答3"],"correct_indices":[0,1]}}"""
+{{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
     try:
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001', max_tokens=800,
@@ -1038,13 +1040,15 @@ def generate_all_mcq():
 
 要件:
 - 選択肢は5つ
-- 正解は1つまたは2つ。2つ正解にできる問題では、同時に選ぶべき正解を2つ作る
-- 正解は模範解答の核心を1〜2文で簡潔にまとめる
-- 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
+- 設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる
+- correct_indices は「設問への答えとして選ぶべき選択肢」の番号にする
+- 問題文が「誤り」「適切でない」「最も適切でない」などを問う場合は、誤っている／適切でない選択肢を correct_indices に入れる
+- correct_indices に入れる選択肢は模範解答の核心を1〜2文で簡潔に反映する
+- correct_indices 以外の選択肢は、それぞれ異なる方向の非該当選択肢にする
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト1","正解テキスト2または誤答","誤答1","誤答2","誤答3"],"correct_indices":[0,1]}}"""
+{{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
         try:
             msg = client.messages.create(
                 model='claude-haiku-4-5-20251001', max_tokens=800,
