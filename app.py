@@ -896,9 +896,45 @@ def get_hint(q_id):
     })
 
 # ── MCQ ──────────────────────────────────────────────────────
+def _normalize_mcq_payload(data):
+    options = data.get('options') or []
+    if len(options) != 5:
+        raise ValueError('MCQ options must contain exactly 5 choices')
+    if isinstance(data.get('correct_indices'), list):
+        correct_indices = sorted({int(i) for i in data['correct_indices'] if 0 <= int(i) < len(options)})
+    elif 'correct_index' in data:
+        correct_indices = [int(data['correct_index'])]
+    else:
+        raise ValueError('MCQ payload must include correct_indices or correct_index')
+    if len(correct_indices) not in (1, 2):
+        raise ValueError('MCQ must have one or two correct choices')
+    return {'options': options, 'correct_index': correct_indices[0], 'correct_indices': correct_indices}
+
+def _shuffle_mcq(options, correct_indices):
+    import random
+    correct_texts = [options[i] for i in correct_indices]
+    shuffled = list(options)
+    random.shuffle(shuffled)
+    return {
+        'options': shuffled,
+        'correct_index': shuffled.index(correct_texts[0]),
+        'correct_indices': sorted(shuffled.index(text) for text in correct_texts),
+    }
+
+def _mcq_cache_matches(payload, requested_count):
+    if requested_count not in (1, 2):
+        return True
+    try:
+        normalized = _normalize_mcq_payload(payload)
+        return len(normalized['correct_indices']) == requested_count
+    except Exception:
+        return False
+
 @app.route('/api/questions/<int:q_id>/mcq')
 def get_mcq(q_id):
     api_key = ANTHROPIC_API_KEY
+    correct_count_raw = request.args.get('correct_count', 'mixed')
+    requested_count = int(correct_count_raw) if correct_count_raw in ('1', '2') else None
     conn = get_db()
     row = conn.execute('SELECT * FROM questions WHERE id=?', (q_id,)).fetchone()
     if not row:
@@ -907,7 +943,8 @@ def get_mcq(q_id):
     if row['mcq_options']:
         try:
             cached = json.loads(row['mcq_options'])
-            if len(cached.get('options', [])) == 5:
+            if len(cached.get('options', [])) == 5 and _mcq_cache_matches(cached, requested_count):
+                cached = _normalize_mcq_payload(cached)
                 conn.close()
                 return jsonify(cached)
         except Exception:
@@ -924,6 +961,10 @@ def get_mcq(q_id):
     answer_text = row['model_answer'] or '\n'.join(
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
     client = anthropic.Anthropic(api_key=api_key)
+    correct_rule = '正解は必ず2つ。2つとも同時に選ぶべき正解にする' if requested_count == 2 else (
+        '正解は必ず1つ' if requested_count == 1 else
+        '正解は1つまたは2つ。2つ正解にできる問題では、同時に選ぶべき正解を2つ作る'
+    )
     prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
 問題: {row['question']}
@@ -932,25 +973,22 @@ def get_mcq(q_id):
 {answer_text[:600]}
 
 要件:
-- 選択肢は5つ（正解1つ＋紛らわしい誤答4つ）
+- 選択肢は5つ
+- {correct_rule}
 - 正解は模範解答の核心を1〜2文で簡潔にまとめる
 - 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト","誤答1","誤答2","誤答3","誤答4"],"correct_index":0}}"""
+{{"options":["正解テキスト1","正解テキスト2または誤答","誤答1","誤答2","誤答3"],"correct_indices":[0,1]}}"""
     try:
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001', max_tokens=800,
             messages=[{'role': 'user', 'content': prompt}])
         raw = msg.content[0].text.strip()
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
-        options = data['options']
-        if len(options) != 5:
-            raise ValueError('MCQ options must contain exactly 5 choices')
-        correct = options[data['correct_index']]
-        random.shuffle(options)
-        result = {'options': options, 'correct_index': options.index(correct)}
+        normalized = _normalize_mcq_payload(data)
+        result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
         conn.execute('UPDATE questions SET mcq_options=? WHERE id=?', (json.dumps(result), q_id))
         conn.commit()
     except Exception as e:
@@ -999,23 +1037,22 @@ def generate_all_mcq():
 {answer_text[:600]}
 
 要件:
-- 選択肢は5つ（正解1つ＋紛らわしい誤答4つ）
+- 選択肢は5つ
+- 正解は1つまたは2つ。2つ正解にできる問題では、同時に選ぶべき正解を2つ作る
 - 正解は模範解答の核心を1〜2文で簡潔にまとめる
 - 誤答はそれぞれ異なる方向の誤り（過剰・不足・混同・逆・部分正解など）
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["正解テキスト","誤答1","誤答2","誤答3","誤答4"],"correct_index":0}}"""
+{{"options":["正解テキスト1","正解テキスト2または誤答","誤答1","誤答2","誤答3"],"correct_indices":[0,1]}}"""
         try:
             msg = client.messages.create(
                 model='claude-haiku-4-5-20251001', max_tokens=800,
                 messages=[{'role': 'user', 'content': prompt}])
             raw = msg.content[0].text.strip()
             data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
-            options = data['options']
-            correct = options[data['correct_index']]
-            random.shuffle(options)
-            result = {'options': options, 'correct_index': options.index(correct)}
+            normalized = _normalize_mcq_payload(data)
+            result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
             c = get_db()
             c.execute('UPDATE questions SET mcq_options=? WHERE id=?',
                       (json.dumps(result, ensure_ascii=False), row['id']))
