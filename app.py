@@ -34,6 +34,52 @@ def get_db():
     conn.row_factory = sqlite3.Row
     return conn
 
+# ── Rate limit (Phase 1: per-IP daily quota) ──────────────────
+RATE_LIMITS = {
+    'score':    int(os.environ.get('RATE_LIMIT_SCORE', 30)),
+    'ai':       int(os.environ.get('RATE_LIMIT_AI',    50)),
+    'extract':  int(os.environ.get('RATE_LIMIT_EXTRACT', 5)),
+}
+
+def _client_id():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+def _check_rate(bucket):
+    limit = RATE_LIMITS.get(bucket, 0)
+    if limit <= 0:
+        return True, 0, 0
+    day = datetime.now().strftime('%Y-%m-%d')
+    cid = _client_id()
+    conn = get_db()
+    row = conn.execute(
+        'SELECT count FROM rate_limits WHERE client_id=? AND bucket=? AND day=?',
+        (cid, bucket, day)
+    ).fetchone()
+    current = row['count'] if row else 0
+    if current >= limit:
+        conn.close()
+        return False, current, limit
+    conn.execute(
+        'INSERT INTO rate_limits (client_id, bucket, day, count) VALUES (?, ?, ?, 1) '
+        'ON CONFLICT(client_id, bucket, day) DO UPDATE SET count = count + 1',
+        (cid, bucket, day)
+    )
+    conn.commit()
+    conn.close()
+    return True, current + 1, limit
+
+def _rate_limit_response(bucket, current, limit):
+    return jsonify({
+        'error': '本日の利用上限に達しました',
+        'detail': f'1日{limit}回まで（明日0時にリセット）',
+        'bucket': bucket,
+        'current': current,
+        'limit': limit,
+    }), 429
+
 def init_db():
     conn = get_db()
     conn.executescript('''
@@ -109,6 +155,15 @@ def init_db():
     cols = [r['name'] for r in conn.execute('PRAGMA table_info(questions)').fetchall()]
     if 'mcq_options' not in cols:
         conn.execute('ALTER TABLE questions ADD COLUMN mcq_options TEXT DEFAULT NULL')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            client_id TEXT NOT NULL,
+            bucket TEXT NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (client_id, bucket, day)
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -153,6 +208,11 @@ def migrate_db():
             SELECT MIN(id) FROM ghost_messages GROUP BY square, message
         )
     ''')
+    # 一掃: _fallback_mcq_options で書き込まれた壊れたMCQキャッシュを削除
+    conn.execute(
+        "UPDATE questions SET mcq_options=NULL "
+        "WHERE mcq_options LIKE '%この問題では、主要な要点ではなく%'"
+    )
     conn.commit()
     # seed ghost messages if empty
     count = conn.execute('SELECT COUNT(*) FROM ghost_messages').fetchone()[0]
@@ -337,6 +397,9 @@ def score():
         return jsonify({'error': '回答を入力してください'}), 400
     if not user_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('score')
+    if not ok:
+        return _rate_limit_response('score', current, limit)
 
     conn = get_db()
     row = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
@@ -382,6 +445,9 @@ def score_sync():
         return jsonify({'error': '回答を入力してください'}), 400
     if not user_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('score')
+    if not ok:
+        return _rate_limit_response('score', current, limit)
 
     conn = get_db()
     row = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
@@ -507,6 +573,9 @@ def upload_questions():
     user_key = ANTHROPIC_API_KEY
     if not user_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('extract')
+    if not ok:
+        return _rate_limit_response('extract', current, limit)
     f = request.files.get('file')
     if not f:
         return jsonify({'error': 'ファイルがありません'}), 400
@@ -827,23 +896,6 @@ def get_hint(q_id):
     })
 
 # ── MCQ ──────────────────────────────────────────────────────
-def _fallback_mcq_options(question, answer_text):
-    """API keyが無い時でも演習を止めないための簡易5択生成。"""
-    base = ' '.join((answer_text or '').replace('\n', ' ').split())
-    if not base:
-        base = '模範解答の要点を押さえて説明できる。'
-    correct = base[:90]
-    if len(base) > 90:
-        correct += '…'
-    stem = 'この問題では'
-    distractors = [
-        f'{stem}、主要な要点ではなく周辺情報だけを述べる。',
-        f'{stem}、結論を逆にして説明する。',
-        f'{stem}、一部の要点だけを拾い重要な条件を落とす。',
-        f'{stem}、問題文と無関係な一般論を答える。',
-    ]
-    return {'options': [correct, *distractors], 'correct_index': 0}
-
 @app.route('/api/questions/<int:q_id>/mcq')
 def get_mcq(q_id):
     api_key = ANTHROPIC_API_KEY
@@ -860,17 +912,17 @@ def get_mcq(q_id):
                 return jsonify(cached)
         except Exception:
             pass
+    if not api_key:
+        conn.close()
+        return jsonify({'error': 'サーバー側のAPIキーが未設定です'}), 503
+    ok, current, limit = _check_rate('ai')
+    if not ok:
+        conn.close()
+        return _rate_limit_response('ai', current, limit)
     import random
     kps = json.loads(row['key_points'] or '[]')
     answer_text = row['model_answer'] or '\n'.join(
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
-    if not api_key:
-        result = _fallback_mcq_options(row['question'], answer_text)
-        conn.execute('UPDATE questions SET mcq_options=? WHERE id=?',
-                     (json.dumps(result, ensure_ascii=False), q_id))
-        conn.commit()
-        conn.close()
-        return jsonify(result)
     client = anthropic.Anthropic(api_key=api_key)
     prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
@@ -1025,6 +1077,9 @@ def companion_react():
         return jsonify({'error': 'player_input required'}), 400
     if not api_key:
         return jsonify({'error': 'サーバー側のAPIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('ai')
+    if not ok:
+        return _rate_limit_response('ai', current, limit)
     try:
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
@@ -1104,6 +1159,9 @@ def score_inline():
         return jsonify({'error': '回答を入力してください'}), 400
     if not user_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('score')
+    if not ok:
+        return _rate_limit_response('score', current, limit)
     kp_str = '\n'.join(f"- (w=2) {k['t']}" for k in key_points if isinstance(k, dict) and k.get('t'))
     client = anthropic.Anthropic(api_key=user_key)
     msg = client.messages.create(
@@ -1194,6 +1252,9 @@ def similar_question(qid):
         return jsonify({'error': '問題が見つかりません'}), 404
     if not api_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('ai')
+    if not ok:
+        return _rate_limit_response('ai', current, limit)
     try:
         kps = json.loads(row['key_points'] or '[]')
         kp_text = '\n'.join(f'・{k["t"]}' for k in kps[:5] if isinstance(k, dict) and k.get('t'))
