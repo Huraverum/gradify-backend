@@ -653,18 +653,32 @@ def vision_quiz():
     ok, current, limit = _check_rate('extract')
     if not ok:
         return _rate_limit_response('extract', current, limit)
+
+    # マルチパート (file) or JSON (image_b64) の両方受け付け
+    image_bytes = None
+    mt = 'image/jpeg'
     f = request.files.get('file')
-    if not f:
-        return jsonify({'error': 'ファイルがありません'}), 400
-    name = (f.filename or '').lower()
-    data = f.read()
-    if not name.endswith(('.jpg','.jpeg','.png','.webp','.gif')):
-        return jsonify({'error': '画像のみ対応（jpg/png/webp/gif）'}), 400
-    mt = ('image/jpeg' if name.endswith(('.jpg','.jpeg')) else
-          'image/png'  if name.endswith('.png')  else
-          'image/webp' if name.endswith('.webp') else 'image/gif')
+    if f:
+        name = (f.filename or '').lower()
+        if not name.endswith(('.jpg','.jpeg','.png','.webp','.gif')):
+            return jsonify({'error': '画像のみ対応（jpg/png/webp/gif）'}), 400
+        image_bytes = f.read()
+        mt = ('image/jpeg' if name.endswith(('.jpg','.jpeg')) else
+              'image/png'  if name.endswith('.png')  else
+              'image/webp' if name.endswith('.webp') else 'image/gif')
+    else:
+        body = request.get_json(silent=True) or {}
+        b64 = body.get('image_b64', '')
+        if not b64:
+            return jsonify({'error': 'ファイルがありません'}), 400
+        mt = body.get('mime_type', 'image/jpeg')
+        try:
+            image_bytes = base64.standard_b64decode(b64)
+        except Exception:
+            return jsonify({'error': 'base64デコード失敗'}), 400
+
     try:
-        result = _call_vision_quiz(data, mt, user_key)
+        result = _call_vision_quiz(image_bytes, mt, user_key)
         return jsonify({'ok': True, **result})
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
