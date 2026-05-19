@@ -161,9 +161,107 @@ def init_db():
             image_id TEXT NOT NULL,
             ai_prediction TEXT NOT NULL,
             user_correction TEXT NOT NULL,
+            ai_candidates TEXT,
+            correct_label TEXT,
+            memo TEXT,
+            category TEXT,
+            confidence REAL,
+            feedback_type TEXT,
             created_at TEXT
         )
     ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS vision_quiz_memory_summaries (
+            memory_key TEXT PRIMARY KEY,
+            category TEXT,
+            correct_label TEXT,
+            summary TEXT,
+            count INTEGER NOT NULL DEFAULT 0,
+            last_seen_at TEXT
+        )
+    ''')
+    correction_cols = [r['name'] for r in conn.execute('PRAGMA table_info(vision_quiz_corrections)').fetchall()]
+    for name, coltype in [
+        ('ai_candidates', 'TEXT'),
+        ('correct_label', 'TEXT'),
+        ('memo', 'TEXT'),
+        ('category', 'TEXT'),
+        ('confidence', 'REAL'),
+        ('feedback_type', 'TEXT'),
+    ]:
+        if name not in correction_cols:
+            conn.execute(f'ALTER TABLE vision_quiz_corrections ADD COLUMN {name} {coltype}')
+    rows = conn.execute(
+        '''
+        SELECT id, ai_prediction, user_correction
+        FROM vision_quiz_corrections
+        WHERE correct_label IS NULL OR memo IS NULL OR category IS NULL
+        '''
+    ).fetchall()
+    for row in rows:
+        try:
+            ai_prediction = json.loads(row['ai_prediction'] or '{}')
+            user_correction = json.loads(row['user_correction'] or '{}')
+        except Exception:
+            continue
+        candidates = ai_prediction.get('candidates') or []
+        candidate_labels = [
+            ' '.join(str(c.get('label') or '').split())[:80]
+            for c in candidates
+            if isinstance(c, dict) and c.get('label')
+        ][:5]
+        correct_label = ' '.join(str(
+            user_correction.get('diagnosis')
+            or user_correction.get('organ')
+            or user_correction.get('feedbackType')
+            or ''
+        ).split())[:120]
+        memo = ' / '.join(
+            ' '.join(str(x).split())
+            for x in [
+                user_correction.get('organ'),
+                user_correction.get('diagnosis'),
+                user_correction.get('comment'),
+                user_correction.get('explanationMemo'),
+                user_correction.get('certainty'),
+                user_correction.get('feedbackType'),
+            ]
+            if ' '.join(str(x or '').split())
+        )[:500]
+        category = ' '.join(str(ai_prediction.get('category') or ai_prediction.get('domain') or '').split())[:80]
+        confidence = float(ai_prediction.get('confidence') or 0)
+        feedback_type = ' '.join(str(user_correction.get('feedbackType') or '').split())[:120]
+        conn.execute(
+            '''
+            UPDATE vision_quiz_corrections
+            SET ai_candidates=?, correct_label=?, memo=?, category=?, confidence=?, feedback_type=?
+            WHERE id=?
+            ''',
+            (
+                json.dumps(candidate_labels, ensure_ascii=False),
+                correct_label,
+                memo,
+                category,
+                confidence,
+                feedback_type,
+                row['id'],
+            ),
+        )
+        label = correct_label or feedback_type or '修正メモ'
+        summary_category = category or '未分類'
+        memory_key = f'{summary_category}:{label}'.lower()
+        summary = ' / '.join(x for x in [summary_category, label, memo] if x)[:500]
+        conn.execute(
+            '''
+            INSERT INTO vision_quiz_memory_summaries(memory_key, category, correct_label, summary, count, last_seen_at)
+            VALUES(?, ?, ?, ?, 1, datetime('now','localtime'))
+            ON CONFLICT(memory_key) DO UPDATE SET
+              summary=excluded.summary,
+              count=count + 1,
+              last_seen_at=excluded.last_seen_at
+            ''',
+            (memory_key, summary_category, label, summary),
+        )
     conn.execute('''
         CREATE TABLE IF NOT EXISTS rate_limits (
             client_id TEXT NOT NULL,
@@ -658,37 +756,174 @@ def upload_questions():
         return jsonify({'error': str(e)}), 500
 
 # ── Vision Quiz (写真→AIクイズ化) ────────────────────────────
-def _vision_quiz_memory_prompt():
+def _clean_memory_text(value, limit=180):
+    return ' '.join(str(value or '').split())[:limit]
+
+def _extract_vision_memory_fields(ai_prediction, user_correction):
+    candidates = ai_prediction.get('candidates') or []
+    candidate_labels = [
+        _clean_memory_text(c.get('label'), 80)
+        for c in candidates
+        if isinstance(c, dict) and c.get('label')
+    ]
+    correct_label = (
+        user_correction.get('diagnosis')
+        or user_correction.get('organ')
+        or user_correction.get('feedbackType')
+        or ''
+    )
+    memo = ' / '.join(x for x in [
+        user_correction.get('organ'),
+        user_correction.get('diagnosis'),
+        user_correction.get('comment'),
+        user_correction.get('explanationMemo'),
+        user_correction.get('certainty'),
+        user_correction.get('feedbackType'),
+    ] if _clean_memory_text(x))
+    return {
+        'ai_candidates': json.dumps(candidate_labels[:5], ensure_ascii=False),
+        'correct_label': _clean_memory_text(correct_label, 120),
+        'memo': _clean_memory_text(memo, 500),
+        'category': _clean_memory_text(ai_prediction.get('category') or ai_prediction.get('domain'), 80),
+        'confidence': float(ai_prediction.get('confidence') or 0),
+        'feedback_type': _clean_memory_text(user_correction.get('feedbackType'), 120),
+    }
+
+def _memory_terms_from_prediction(prediction):
+    terms = []
+    for key in ['category', 'domain', 'title', 'subject']:
+        value = _clean_memory_text(prediction.get(key), 80)
+        if value:
+            terms.append(value)
+    for c in prediction.get('candidates') or []:
+        if isinstance(c, dict):
+            label = _clean_memory_text(c.get('label'), 80)
+            if label:
+                terms.append(label)
+    return [t for i, t in enumerate(terms) if t and t not in terms[:i]]
+
+def _score_memory_row(row, terms, category):
+    keys = set(row.keys())
+    def val(name):
+        return row[name] if name in keys else ''
+    haystack = ' '.join([
+        val('category') or '',
+        val('correct_label') or '',
+        val('memo') or '',
+        val('ai_candidates') or '',
+        val('feedback_type') or '',
+        val('summary') or '',
+    ]).lower()
+    score = 0
+    if category and category == (val('category') or ''):
+        score += 2
+    ai_candidates = (val('ai_candidates') or '').lower()
+    for term in terms:
+        t = term.lower()
+        if not t:
+            continue
+        correct_label = (val('correct_label') or '').lower()
+        if t == correct_label:
+            score += 10
+        elif correct_label and (t in correct_label or correct_label in t):
+            score += 6
+        elif t in ai_candidates:
+            score += 6
+        elif t in haystack:
+            score += 3
+    return score
+
+def _upsert_vision_memory_summary(conn, fields, created_at):
+    label = fields['correct_label'] or fields['feedback_type'] or '修正メモ'
+    category = fields['category'] or '未分類'
+    memory_key = f'{category}:{label}'.lower()
+    summary_parts = [category, label, fields['memo']]
+    summary = _clean_memory_text(' / '.join(x for x in summary_parts if x), 500)
+    conn.execute(
+        '''
+        INSERT INTO vision_quiz_memory_summaries(memory_key, category, correct_label, summary, count, last_seen_at)
+        VALUES(?, ?, ?, ?, 1, ?)
+        ON CONFLICT(memory_key) DO UPDATE SET
+          summary=excluded.summary,
+          count=count + 1,
+          last_seen_at=excluded.last_seen_at
+        ''',
+        (memory_key, category, label, summary, created_at),
+    )
+
+def _vision_quiz_memory_prompt(prediction):
+    terms = _memory_terms_from_prediction(prediction)
+    category = _clean_memory_text(prediction.get('category') or prediction.get('domain'), 80)
+    if not terms and not category:
+        return ''
     conn = get_db()
     rows = conn.execute(
-        'SELECT user_correction FROM vision_quiz_corrections ORDER BY id DESC LIMIT 12'
+        '''
+        SELECT id, image_id, ai_candidates, correct_label, memo, category, confidence, feedback_type, created_at
+        FROM vision_quiz_corrections
+        ORDER BY id DESC
+        LIMIT 1000
+        '''
+    ).fetchall()
+    summary_rows = conn.execute(
+        '''
+        SELECT category, correct_label, summary, count, last_seen_at
+        FROM vision_quiz_memory_summaries
+        ORDER BY count DESC, last_seen_at DESC
+        LIMIT 100
+        '''
     ).fetchall()
     conn.close()
-    memories = []
-    for r in rows:
-        try:
-            c = json.loads(r['user_correction'] or '{}')
-        except Exception:
-            continue
-        target = c.get('organ') or ''
-        label = c.get('diagnosis') or ''
-        comment = c.get('comment') or ''
-        memo = c.get('explanationMemo') or ''
-        certainty = c.get('certainty') or ''
-        line = ' / '.join(x for x in [target, label, comment, memo, certainty] if x)
-        if line:
-            memories.append(line[:180])
-    if not memories:
-        return ''
-    return '\n\n過去にユーザーが教えた修正メモです。今回の画像に似ている場合だけ参考にし、無理に当てはめないでください:\n- ' + '\n- '.join(memories)
 
-def _call_vision_quiz(image_bytes, media_type, user_key):
+    scored = []
+    for row in rows:
+        score = _score_memory_row(row, terms, category)
+        if score >= 6:
+            scored.append((score, row))
+    scored.sort(key=lambda x: (x[0], x[1]['id']), reverse=True)
+    selected = [row for _, row in scored[:20]]
+
+    scored_summaries = []
+    for row in summary_rows:
+        score = _score_memory_row(row, terms, category)
+        if score >= 6:
+            scored_summaries.append((score + min(int(row['count'] or 0), 10), row))
+    scored_summaries.sort(key=lambda x: (x[0], x[1]['count'] or 0), reverse=True)
+
+    lines = []
+    for row in [r for _, r in scored_summaries[:8]]:
+        lines.append(f"頻出({row['count']}回): {_clean_memory_text(row['summary'], 220)}")
+    for row in selected:
+        candidates = row['ai_candidates'] or ''
+        try:
+            parsed_candidates = json.loads(candidates)
+            candidates = ', '.join(parsed_candidates[:3]) if isinstance(parsed_candidates, list) else candidates
+        except Exception:
+            pass
+        line = ' / '.join(x for x in [
+            row['category'],
+            f"AI候補: {candidates}" if candidates else '',
+            f"正解/修正: {row['correct_label']}" if row['correct_label'] else '',
+            row['memo'],
+        ] if x)
+        if line:
+            lines.append(_clean_memory_text(line, 260))
+    if not lines:
+        return ''
+    return (
+        '\n\n過去のユーザーフィードバックから、今回の初回推定に関連しそうな記憶だけを抽出しました。'
+        '似ている場合だけ参考にし、矛盾する場合は画像所見を優先してください。'
+        'この記憶は候補の出し方・不確実性の扱い・修正候補に反映します:\n- '
+        + '\n- '.join(lines[:28])
+    )
+
+def _call_vision_quiz(image_bytes, media_type, user_key, memory_prompt=''):
     client = anthropic.Anthropic(api_key=user_key)
     msg = client.messages.create(
         model='claude-sonnet-4-6', max_tokens=2048,
         messages=[{'role':'user','content':[
             {'type':'image','source':{'type':'base64','media_type':media_type,'data':base64.standard_b64encode(image_bytes).decode()}},
-            {'type':'text','text':VISION_QUIZ_PROMPT + _vision_quiz_memory_prompt()},
+            {'type':'text','text':VISION_QUIZ_PROMPT + memory_prompt},
         ]}])
     text = msg.content[0].text.strip()
     m = re.search(r'\{.*\}', text, re.DOTALL)
@@ -757,6 +992,9 @@ def vision_quiz():
 
     try:
         result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key))
+        memory_prompt = _vision_quiz_memory_prompt(result)
+        if memory_prompt:
+            result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key, memory_prompt))
         image_id = hashlib.sha256(image_bytes).hexdigest()[:24]
         return jsonify({'ok': True, 'imageId': image_id, **result})
     except Exception as e:
@@ -773,16 +1011,29 @@ def save_vision_quiz_correction():
     if not user_correction:
         return jsonify({'ok': False, 'error': 'userCorrection は必須です'}), 400
     created_at = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    fields = _extract_vision_memory_fields(ai_prediction, user_correction)
     conn = get_db()
     conn.execute(
-        'INSERT INTO vision_quiz_corrections(image_id,ai_prediction,user_correction,created_at) VALUES(?,?,?,?)',
+        '''
+        INSERT INTO vision_quiz_corrections(
+            image_id, ai_prediction, user_correction, ai_candidates, correct_label,
+            memo, category, confidence, feedback_type, created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        ''',
         (
             image_id,
             json.dumps(ai_prediction, ensure_ascii=False),
             json.dumps(user_correction, ensure_ascii=False),
+            fields['ai_candidates'],
+            fields['correct_label'],
+            fields['memo'],
+            fields['category'],
+            fields['confidence'],
+            fields['feedback_type'],
             created_at,
         )
     )
+    _upsert_vision_memory_summary(conn, fields, created_at)
     conn.commit()
     conn.close()
     organ = user_correction.get('organ') or ''
@@ -1320,6 +1571,7 @@ def backup():
         'wallet':         [dict(r) for r in conn.execute('SELECT * FROM wallet').fetchall()],
         'achievement_unlocks': [dict(r) for r in conn.execute('SELECT * FROM achievement_unlocks').fetchall()],
         'vision_quiz_corrections': [dict(r) for r in conn.execute('SELECT * FROM vision_quiz_corrections').fetchall()],
+        'vision_quiz_memory_summaries': [dict(r) for r in conn.execute('SELECT * FROM vision_quiz_memory_summaries').fetchall()],
     }
     conn.close()
     return jsonify(data)
@@ -1345,7 +1597,7 @@ def restore():
         return jsonify({'error': 'バックアップ形式が不正です'}), 400
     conn = get_db()
     try:
-        for table in ['decks', 'questions', 'attempts', 'results', 'ghost_messages', 'wallet', 'achievement_unlocks', 'vision_quiz_corrections']:
+        for table in ['decks', 'questions', 'attempts', 'results', 'ghost_messages', 'wallet', 'achievement_unlocks', 'vision_quiz_corrections', 'vision_quiz_memory_summaries']:
             rows = data.get(table, [])
             if rows is None:
                 continue
