@@ -39,6 +39,7 @@ RATE_LIMITS = {
     'score':    int(os.environ.get('RATE_LIMIT_SCORE', 30)),
     'ai':       int(os.environ.get('RATE_LIMIT_AI',    50)),
     'extract':  int(os.environ.get('RATE_LIMIT_EXTRACT', 5)),
+    'vision_quiz': int(os.environ.get('RATE_LIMIT_VISION_QUIZ', 7)),
 }
 
 def _client_id():
@@ -967,6 +968,9 @@ def vision_quiz():
     user_key = ANTHROPIC_API_KEY
     if not user_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    ok, current, limit = _check_rate('vision_quiz')
+    if not ok:
+        return _rate_limit_response('vision_quiz', current, limit)
     # マルチパート (file) or JSON (image_b64) の両方受け付け
     image_bytes = None
     mt = 'image/jpeg'
