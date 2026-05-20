@@ -13,12 +13,14 @@ RESULTS_DB = os.path.join(DATA_DIR, 'results.db')
 os.makedirs(DATA_DIR, exist_ok=True)
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
+ADMIN_API_TOKEN = os.environ.get('GRADIFY_ADMIN_TOKEN', '')
+LEGACY_USER_ID = 'legacy'
 
 # ── CORS ──────────────────────────────────────────────────────
 @app.after_request
 def cors(r):
     r.headers['Access-Control-Allow-Origin']  = '*'
-    r.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    r.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Gradify-User-ID, X-Admin-Token'
     r.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     return r
 
@@ -47,6 +49,29 @@ def _client_id():
     if fwd:
         return fwd.split(',')[0].strip()
     return request.remote_addr or 'unknown'
+
+def _user_id():
+    raw = (
+        request.headers.get('X-Gradify-User-ID')
+        or (request.get_json(silent=True) or {}).get('user_id')
+        or LEGACY_USER_ID
+    )
+    user_id = re.sub(r'[^A-Za-z0-9_.:-]', '', str(raw))[:80]
+    return user_id or LEGACY_USER_ID
+
+def _require_admin():
+    if not ADMIN_API_TOKEN:
+        return jsonify({'error': '教材マスターの編集は管理者のみ可能です'}), 403
+    token = request.headers.get('X-Admin-Token') or request.headers.get('Authorization', '').removeprefix('Bearer ').strip()
+    if token != ADMIN_API_TOKEN:
+        return jsonify({'error': '教材マスターの編集は管理者のみ可能です'}), 403
+    return None
+
+def _ensure_wallet(conn, user_id):
+    conn.execute(
+        'INSERT OR IGNORE INTO wallet(user_id, balance) VALUES(?, 0)',
+        (user_id,)
+    )
 
 def _check_rate(bucket):
     limit = RATE_LIMITS.get(bucket, 0)
@@ -151,7 +176,52 @@ def init_db():
             UNIQUE(achievement_id, user_token)
         );
     ''')
-    conn.execute('INSERT OR IGNORE INTO wallet(id, balance) VALUES(1, 0)')
+    wallet_cols = [r['name'] for r in conn.execute('PRAGMA table_info(wallet)').fetchall()]
+    if 'user_id' not in wallet_cols:
+        old_wallet = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()
+        old_balance = old_wallet['balance'] if old_wallet else 0
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS wallet_v2 (
+                user_id TEXT PRIMARY KEY,
+                balance INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
+        conn.execute('INSERT OR REPLACE INTO wallet_v2(user_id, balance) VALUES(?, ?)', (LEGACY_USER_ID, old_balance))
+        conn.execute('DROP TABLE wallet')
+        conn.execute('ALTER TABLE wallet_v2 RENAME TO wallet')
+    _ensure_wallet(conn, LEGACY_USER_ID)
+
+    result_cols = [r['name'] for r in conn.execute('PRAGMA table_info(results)').fetchall()]
+    if 'user_id' not in result_cols:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS results_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL DEFAULT 'legacy',
+                question_id INTEGER,
+                score INTEGER,
+                grade TEXT,
+                answer TEXT,
+                model_answer TEXT,
+                covered TEXT,
+                partial TEXT,
+                missed TEXT,
+                feedback TEXT,
+                advice TEXT,
+                saved_at TEXT,
+                UNIQUE(user_id, question_id)
+            )
+        ''')
+        conn.execute('''
+            INSERT INTO results_v2(id,user_id,question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at)
+            SELECT id,?,question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at FROM results
+        ''', (LEGACY_USER_ID,))
+        conn.execute('DROP TABLE results')
+        conn.execute('ALTER TABLE results_v2 RENAME TO results')
+
+    attempt_cols = [r['name'] for r in conn.execute('PRAGMA table_info(attempts)').fetchall()]
+    if 'user_id' not in attempt_cols:
+        conn.execute("ALTER TABLE attempts ADD COLUMN user_id TEXT DEFAULT 'legacy'")
+        conn.execute("UPDATE attempts SET user_id=? WHERE user_id IS NULL OR user_id=''", (LEGACY_USER_ID,))
     # migration: add mcq_options column if missing
     cols = [r['name'] for r in conn.execute('PRAGMA table_info(questions)').fetchall()]
     if 'mcq_options' not in cols:
@@ -403,6 +473,8 @@ def get_decks():
 
 @app.route('/api/decks', methods=['POST'])
 def create_deck():
+    denied = _require_admin()
+    if denied: return denied
     d = request.get_json(force=True)
     name = (d.get('name') or '').strip()
     if not name:
@@ -417,6 +489,8 @@ def create_deck():
 
 @app.route('/api/decks/<int:deck_id>', methods=['DELETE'])
 def delete_deck(deck_id):
+    denied = _require_admin()
+    if denied: return denied
     conn = get_db()
     conn.execute('DELETE FROM questions WHERE deck_id=?', (deck_id,))
     conn.execute('DELETE FROM decks WHERE id=?', (deck_id,))
@@ -427,6 +501,7 @@ def delete_deck(deck_id):
 # ── Question API ──────────────────────────────────────────────
 @app.route('/api/decks/<int:deck_id>/questions', methods=['GET'])
 def get_questions(deck_id):
+    user_id = _user_id()
     category = request.args.get('category', '')
     limit    = request.args.get('limit', type=int)
     shuffle  = request.args.get('shuffle', '0') == '1'
@@ -440,17 +515,17 @@ def get_questions(deck_id):
         # Attempted questions, lowest avg score first
         sql  = f'''SELECT q.* FROM questions q
                    JOIN attempts a ON a.question_id = q.id
-                   WHERE q.deck_id=? {cat_clause}
+                   WHERE q.deck_id=? AND a.user_id=? {cat_clause}
                    GROUP BY q.id
                    ORDER BY AVG(a.score) ASC'''
-        rows = conn.execute(sql, [deck_id] + cat_params).fetchall()
+        rows = conn.execute(sql, [deck_id, user_id] + cat_params).fetchall()
     elif mode == 'new':
         # Questions with zero attempts
         sql  = f'''SELECT q.* FROM questions q
                    WHERE q.deck_id=?
-                   AND q.id NOT IN (SELECT DISTINCT question_id FROM attempts)
+                   AND q.id NOT IN (SELECT DISTINCT question_id FROM attempts WHERE user_id=?)
                    {cat_clause}'''
-        rows = conn.execute(sql, [deck_id] + cat_params).fetchall()
+        rows = conn.execute(sql, [deck_id, user_id] + cat_params).fetchall()
         if shuffle:
             import random; random.shuffle(rows := list(rows))
     else:
@@ -471,6 +546,8 @@ def get_questions(deck_id):
 
 @app.route('/api/decks/<int:deck_id>/questions', methods=['POST'])
 def add_question(deck_id):
+    denied = _require_admin()
+    if denied: return denied
     d = request.get_json(force=True)
     question = (d.get('question') or '').strip()
     if not question:
@@ -500,6 +577,8 @@ def get_categories(deck_id):
 
 @app.route('/api/questions/<int:q_id>', methods=['PUT'])
 def update_question(q_id):
+    denied = _require_admin()
+    if denied: return denied
     d = request.get_json(force=True)
     question = (d.get('question') or '').strip()
     if not question:
@@ -517,6 +596,8 @@ def update_question(q_id):
 
 @app.route('/api/questions/<int:q_id>', methods=['DELETE'])
 def delete_question(q_id):
+    denied = _require_admin()
+    if denied: return denied
     conn = get_db()
     conn.execute('DELETE FROM questions WHERE id=?', (q_id,))
     conn.commit()
@@ -527,6 +608,7 @@ def delete_question(q_id):
 @app.route('/api/score', methods=['POST'])
 def score():
     d = request.get_json(force=True)
+    user_id = _user_id()
     qid    = d.get('question_id')
     answer = (d.get('answer') or '').strip()
     user_key = ANTHROPIC_API_KEY
@@ -563,7 +645,7 @@ def score():
                 yield f"data: {json.dumps({'chunk': t}, ensure_ascii=False)}\n\n"
         try:
             data = json.loads(full)
-            _save_attempt(qid, data, answer)
+            _save_attempt(qid, data, answer, user_id)
             yield f"data: {json.dumps({'done': True, **data}, ensure_ascii=False)}\n\n"
         except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
@@ -574,6 +656,7 @@ def score():
 @app.route('/api/score-sync', methods=['POST'])
 def score_sync():
     d = request.get_json(force=True)
+    user_id = _user_id()
     qid      = d.get('question_id')
     answer   = (d.get('answer') or '').strip()
     user_key = ANTHROPIC_API_KEY
@@ -622,32 +705,34 @@ def score_sync():
         earned = COIN_MAP.get(result['grade'], 10)
         result['coins_earned'] = earned
         conn2 = get_db()
-        conn2.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (earned,))
+        _ensure_wallet(conn2, user_id)
+        conn2.execute('UPDATE wallet SET balance = balance + ? WHERE user_id=?', (earned, user_id))
         conn2.commit()
         conn2.close()
-    _save_attempt(qid, result, answer)
+    _save_attempt(qid, result, answer, user_id)
     return jsonify(result)
 
-def _save_attempt(qid, d, answer):
+def _save_attempt(qid, d, answer, user_id=None):
+    user_id = user_id or _user_id()
     conn = get_db()
     score = d.get('score', 0)
     conn.execute(
-        'INSERT INTO attempts(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO attempts(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at,user_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
         (qid, score, d.get('grade',''),
          answer, d.get('model_answer',''),
          json.dumps(d.get('covered',[]), ensure_ascii=False),
          json.dumps(d.get('partial',[]), ensure_ascii=False),
          json.dumps(d.get('missed',[]),  ensure_ascii=False),
          d.get('feedback',''), d.get('advice',''),
-         datetime.now().strftime('%Y-%m-%d %H:%M')))
-    conn.execute('''INSERT INTO results(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        ON CONFLICT(question_id) DO UPDATE SET
+         datetime.now().strftime('%Y-%m-%d %H:%M'), user_id))
+    conn.execute('''INSERT INTO results(user_id,question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(user_id, question_id) DO UPDATE SET
             score=excluded.score, grade=excluded.grade, answer=excluded.answer,
             model_answer=excluded.model_answer, covered=excluded.covered,
             partial=excluded.partial, missed=excluded.missed,
             feedback=excluded.feedback, advice=excluded.advice, saved_at=excluded.saved_at''',
-        (qid, score, d.get('grade',''),
+        (user_id, qid, score, d.get('grade',''),
          answer, d.get('model_answer',''),
          json.dumps(d.get('covered',[]), ensure_ascii=False),
          json.dumps(d.get('partial',[]),  ensure_ascii=False),
@@ -660,8 +745,9 @@ def _save_attempt(qid, d, answer):
 # ── Results / Attempts API ────────────────────────────────────
 @app.route('/api/results')
 def get_results():
+    user_id = _user_id()
     conn = get_db()
-    rows = conn.execute('SELECT * FROM results').fetchall()
+    rows = conn.execute('SELECT * FROM results WHERE user_id=?', (user_id,)).fetchall()
     conn.close()
     return jsonify({r['question_id']: {
         'score': r['score'], 'grade': r['grade'],
@@ -676,9 +762,11 @@ def get_results():
 
 @app.route('/api/attempts')
 def get_attempts():
+    user_id = _user_id()
     conn = get_db()
     rows = conn.execute(
-        'SELECT question_id,score,grade,answer,covered,partial,missed,feedback,advice,attempted_at FROM attempts ORDER BY attempted_at ASC'
+        'SELECT question_id,score,grade,answer,covered,partial,missed,feedback,advice,attempted_at FROM attempts WHERE user_id=? ORDER BY attempted_at ASC',
+        (user_id,)
     ).fetchall()
     conn.close()
     result = {}
@@ -1159,6 +1247,7 @@ def seal_ghost(msg_id):
 # ── Stats API ─────────────────────────────────────────────────
 @app.route('/api/stats')
 def get_stats():
+    user_id = _user_id()
     conn = get_db()
     decks = conn.execute('SELECT * FROM decks').fetchall()
     ADVANCE = {'S': 5, 'A': 4, 'B': 3, 'C': 2, 'D': 1}
@@ -1174,7 +1263,7 @@ def get_stats():
             continue
         ph = ','.join('?' * len(qids))
         attempts = conn.execute(
-            f'SELECT score,grade FROM attempts WHERE question_id IN ({ph})', qids).fetchall()
+            f'SELECT score,grade FROM attempts WHERE user_id=? AND question_id IN ({ph})', [user_id] + qids).fetchall()
         if not attempts:
             continue
         count = len(attempts)
@@ -1213,35 +1302,42 @@ def get_stats():
 # ── Wallet ───────────────────────────────────────────────────
 @app.route('/api/wallet')
 def get_wallet():
+    user_id = _user_id()
     conn = get_db()
-    row = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()
+    _ensure_wallet(conn, user_id)
+    conn.commit()
+    row = conn.execute('SELECT balance FROM wallet WHERE user_id=?', (user_id,)).fetchone()
     conn.close()
     return jsonify({'balance': row['balance'] if row else 0})
 
 @app.route('/api/wallet/spend', methods=['POST'])
 def spend_wallet():
+    user_id = _user_id()
     d = request.get_json(force=True)
     cost = int(d.get('cost', 0))
     conn = get_db()
-    row = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()
+    _ensure_wallet(conn, user_id)
+    row = conn.execute('SELECT balance FROM wallet WHERE user_id=?', (user_id,)).fetchone()
     balance = row['balance'] if row else 0
     if balance < cost:
         conn.close()
         return jsonify({'error': '石が足りません'}), 400
-    conn.execute('UPDATE wallet SET balance = balance - ? WHERE id=1', (cost,))
+    conn.execute('UPDATE wallet SET balance = balance - ? WHERE user_id=?', (cost, user_id))
     conn.commit()
-    new_balance = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    new_balance = conn.execute('SELECT balance FROM wallet WHERE user_id=?', (user_id,)).fetchone()['balance']
     conn.close()
     return jsonify({'balance': new_balance})
 
 @app.route('/api/wallet/earn', methods=['POST'])
 def earn_wallet():
+    user_id = _user_id()
     d = request.get_json(force=True)
     amount = int(d.get('amount', 0))
     conn = get_db()
-    conn.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (amount,))
+    _ensure_wallet(conn, user_id)
+    conn.execute('UPDATE wallet SET balance = balance + ? WHERE user_id=?', (amount, user_id))
     conn.commit()
-    new_balance = conn.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    new_balance = conn.execute('SELECT balance FROM wallet WHERE user_id=?', (user_id,)).fetchone()['balance']
     conn.close()
     return jsonify({'balance': new_balance})
 
@@ -1431,6 +1527,8 @@ def get_mcq(q_id):
 
 @app.route('/api/mcq/clear-cache', methods=['POST'])
 def clear_mcq_cache():
+    denied = _require_admin()
+    if denied: return denied
     """mcq_options を全てNULLにリセット（択数変更時などに使用）。"""
     conn = get_db()
     conn.execute('UPDATE questions SET mcq_options=NULL')
@@ -1441,6 +1539,8 @@ def clear_mcq_cache():
 
 @app.route('/api/mcq/generate-all', methods=['POST'])
 def generate_all_mcq():
+    denied = _require_admin()
+    if denied: return denied
     """mcq_options が NULL の全問題に対して一括生成してキャッシュする。"""
     d = request.get_json(force=True)
     api_key = ANTHROPIC_API_KEY
@@ -1499,6 +1599,7 @@ def generate_all_mcq():
 
 @app.route('/api/score-mcq', methods=['POST'])
 def score_mcq():
+    user_id = _user_id()
     d = request.get_json(force=True)
     q_id    = int(d['question_id'])
     correct = bool(d['correct'])
@@ -1518,11 +1619,12 @@ def score_mcq():
         'feedback': '正解です！' if correct else '不正解。解説を確認しましょう。',
         'advice': '', 'coins_earned': coins,
     }
-    _save_attempt(q_id, result, '5択:正解' if correct else '5択:不正解')
+    _save_attempt(q_id, result, '5択:正解' if correct else '5択:不正解', user_id)
     conn2 = get_db()
-    conn2.execute('UPDATE wallet SET balance = balance + ? WHERE id=1', (coins,))
+    _ensure_wallet(conn2, user_id)
+    conn2.execute('UPDATE wallet SET balance = balance + ? WHERE user_id=?', (coins, user_id))
     conn2.commit()
-    new_balance = conn2.execute('SELECT balance FROM wallet WHERE id=1').fetchone()['balance']
+    new_balance = conn2.execute('SELECT balance FROM wallet WHERE user_id=?', (user_id,)).fetchone()['balance']
     conn2.close()
     result['balance'] = new_balance
     return jsonify(result)
@@ -1565,15 +1667,16 @@ def companion_react():
 # ── Backup / Restore ─────────────────────────────────────────
 @app.route('/api/backup')
 def backup():
+    user_id = _user_id()
     conn = get_db()
     data = {
         'decks':          [dict(r) for r in conn.execute('SELECT * FROM decks').fetchall()],
         'questions':      [dict(r) for r in conn.execute('SELECT * FROM questions').fetchall()],
-        'attempts':       [dict(r) for r in conn.execute('SELECT * FROM attempts').fetchall()],
-        'results':        [dict(r) for r in conn.execute('SELECT * FROM results').fetchall()],
+        'attempts':       [dict(r) for r in conn.execute('SELECT * FROM attempts WHERE user_id=?', (user_id,)).fetchall()],
+        'results':        [dict(r) for r in conn.execute('SELECT * FROM results WHERE user_id=?', (user_id,)).fetchall()],
         'ghost_messages': [dict(r) for r in conn.execute('SELECT * FROM ghost_messages').fetchall()],
-        'wallet':         [dict(r) for r in conn.execute('SELECT * FROM wallet').fetchall()],
-        'achievement_unlocks': [dict(r) for r in conn.execute('SELECT * FROM achievement_unlocks').fetchall()],
+        'wallet':         [dict(r) for r in conn.execute('SELECT * FROM wallet WHERE user_id=?', (user_id,)).fetchall()],
+        'achievement_unlocks': [dict(r) for r in conn.execute('SELECT * FROM achievement_unlocks WHERE user_token=?', (user_id,)).fetchall()],
         'vision_quiz_corrections': [dict(r) for r in conn.execute('SELECT * FROM vision_quiz_corrections').fetchall()],
         'vision_quiz_memory_summaries': [dict(r) for r in conn.execute('SELECT * FROM vision_quiz_memory_summaries').fetchall()],
     }
@@ -1599,17 +1702,28 @@ def restore():
         return jsonify({'error': 'バックアップJSONを読み取れません'}), 400
     if not isinstance(data, dict):
         return jsonify({'error': 'バックアップ形式が不正です'}), 400
+    user_id = _user_id()
     conn = get_db()
     try:
-        for table in ['decks', 'questions', 'attempts', 'results', 'ghost_messages', 'wallet', 'achievement_unlocks', 'vision_quiz_corrections', 'vision_quiz_memory_summaries']:
+        admin_ok = _require_admin() is None
+        tables = ['attempts', 'results', 'wallet', 'achievement_unlocks']
+        if admin_ok:
+            tables = ['decks', 'questions', 'ghost_messages'] + tables + ['vision_quiz_corrections', 'vision_quiz_memory_summaries']
+        for table in tables:
             rows = data.get(table, [])
             if rows is None:
                 continue
             if not isinstance(rows, list):
                 return jsonify({'error': f'{table} の形式が不正です'}), 400
             for row in rows:
-                if isinstance(row, dict):
-                    _insert_replace_row(conn, table, row)
+                if not isinstance(row, dict):
+                    continue
+                row = dict(row)
+                if table in ('attempts', 'results', 'wallet'):
+                    row['user_id'] = user_id
+                if table == 'achievement_unlocks':
+                    row['user_token'] = user_id
+                _insert_replace_row(conn, table, row)
         conn.commit()
         return jsonify({'ok': True})
     except Exception as e:
@@ -1662,6 +1776,7 @@ def score_inline():
 # ── Weakness radar ───────────────────────────────────────────
 @app.route('/api/weakness-radar')
 def weakness_radar():
+    user_id = _user_id()
     conn = get_db()
     rows = conn.execute('''
         SELECT q.category,
@@ -1670,17 +1785,18 @@ def weakness_radar():
                ROUND(SUM(CASE WHEN a.grade IN ('S','A') THEN 1 ELSE 0 END) * 100.0 / COUNT(a.id), 1) AS high_pct
         FROM attempts a
         JOIN questions q ON a.question_id = q.id
-        WHERE q.category IS NOT NULL AND q.category != ''
+        WHERE a.user_id=? AND q.category IS NOT NULL AND q.category != ''
         GROUP BY q.category
         HAVING COUNT(a.id) >= 1
         ORDER BY avg_score ASC
-    ''').fetchall()
+    ''', (user_id,)).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
 # ── Mistake cards ─────────────────────────────────────────────
 @app.route('/api/mistake-cards')
 def mistake_cards():
+    user_id = _user_id()
     conn = get_db()
     rows = conn.execute('''
         SELECT q.id, q.question, q.key_points, q.category,
@@ -1689,11 +1805,12 @@ def mistake_cards():
                COUNT(a.id)  AS attempt_count
         FROM questions q
         JOIN attempts a ON a.question_id = q.id
+        WHERE a.user_id=?
         GROUP BY q.id
         HAVING avg_score < 65
         ORDER BY avg_score ASC
         LIMIT 30
-    ''').fetchall()
+    ''', (user_id,)).fetchall()
     conn.close()
     cards = []
     for r in rows:
@@ -1759,17 +1876,20 @@ def similar_question(qid):
 # ── Wipe all user data ────────────────────────────────────────
 @app.route('/api/wipe', methods=['POST'])
 def wipe_all():
+    user_id = _user_id()
     d = request.get_json(silent=True) or {}
     if d.get('confirm') != 'DELETE_ALL_DATA':
         return jsonify({'error': 'confirmation token required'}), 400
     conn = get_db()
     counts = {}
-    for table in ('attempts', 'results', 'questions', 'decks',
-                  'ghost_messages', 'achievement_unlocks'):
-        row = conn.execute(f'SELECT COUNT(*) AS n FROM {table}').fetchone()
+    for table in ('attempts', 'results'):
+        row = conn.execute(f'SELECT COUNT(*) AS n FROM {table} WHERE user_id=?', (user_id,)).fetchone()
         counts[table] = row['n']
-        conn.execute(f'DELETE FROM {table}')
-    conn.execute('UPDATE wallet SET balance=0 WHERE id=1')
+        conn.execute(f'DELETE FROM {table} WHERE user_id=?', (user_id,))
+    row = conn.execute('SELECT COUNT(*) AS n FROM achievement_unlocks WHERE user_token=?', (user_id,)).fetchone()
+    counts['achievement_unlocks'] = row['n']
+    conn.execute('DELETE FROM achievement_unlocks WHERE user_token=?', (user_id,))
+    conn.execute('DELETE FROM wallet WHERE user_id=?', (user_id,))
     conn.commit()
     conn.close()
     return jsonify({'status': 'ok', 'deleted': counts})

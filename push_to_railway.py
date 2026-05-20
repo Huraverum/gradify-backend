@@ -3,7 +3,7 @@
 ローカル results.db の問題を Railway 上の gradify バックエンドに直接 POST するスクリプト。
 使い方: python3 push_to_railway.py https://your-app.railway.app
 """
-import json, sys, sqlite3, time
+import json, os, sys, sqlite3, time
 import urllib.request
 
 LOCAL_DB = '/home/ubu/gradify_backend/data/results.db'
@@ -14,12 +14,15 @@ if len(sys.argv) < 2:
     sys.exit(1)
 
 BASE_URL = sys.argv[1].rstrip('/')
+ADMIN_TOKEN = os.environ.get('GRADIFY_ADMIN_TOKEN', '')
 
 def req(method, path, body=None):
     url = BASE_URL + path
     data = json.dumps(body).encode() if body else None
-    r = urllib.request.Request(url, data=data, method=method,
-        headers={'Content-Type': 'application/json'})
+    headers = {'Content-Type': 'application/json'}
+    if ADMIN_TOKEN:
+        headers['X-Admin-Token'] = ADMIN_TOKEN
+    r = urllib.request.Request(url, data=data, method=method, headers=headers)
     with urllib.request.urlopen(r, timeout=15) as resp:
         return json.loads(resp.read())
 
