@@ -7,6 +7,13 @@ import anthropic
 
 app = Flask(__name__)
 
+@app.after_request
+def _no_cache_html_json(resp):
+    ct = resp.headers.get('Content-Type', '')
+    if 'html' in ct or 'json' in ct:
+        resp.headers['Cache-Control'] = 'no-cache, must-revalidate'
+    return resp
+
 PORT      = int(os.environ.get('PORT', 8000))
 DATA_DIR  = os.environ.get('DATA_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
 RESULTS_DB = os.path.join(DATA_DIR, 'results.db')
@@ -174,6 +181,15 @@ def init_db():
             user_token TEXT NOT NULL,
             unlocked_at TEXT DEFAULT (datetime('now','localtime')),
             UNIQUE(achievement_id, user_token)
+        );
+        CREATE TABLE IF NOT EXISTS feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scene_id TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            comment TEXT,
+            context_json TEXT,
+            user_token TEXT,
+            created_at TEXT DEFAULT (datetime('now','localtime'))
         );
     ''')
     wallet_cols = [r['name'] for r in conn.execute('PRAGMA table_info(wallet)').fetchall()]
@@ -1664,6 +1680,30 @@ def companion_react():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ── Inconsistency feedback ────────────────────────────────────
+FEEDBACK_TAGS = {'因果飛び', '話者不明', '状態矛盾', '補完過剰', 'その他'}
+
+@app.route('/api/feedback', methods=['POST'])
+def submit_feedback():
+    data = request.get_json(silent=True) or {}
+    scene_id = ' '.join(str(data.get('scene_id') or '').split())[:160]
+    tag = ' '.join(str(data.get('tag') or '').split())[:40]
+    comment = str(data.get('comment') or '').strip()[:1000]
+    context = data.get('context') if isinstance(data.get('context'), dict) else {}
+    if not scene_id:
+        return jsonify({'error': 'scene_id is required'}), 400
+    if tag not in FEEDBACK_TAGS:
+        return jsonify({'error': 'feedback tag is invalid'}), 400
+    conn = get_db()
+    cur = conn.execute(
+        'INSERT INTO feedback(scene_id,tag,comment,context_json,user_token,created_at) VALUES(?,?,?,?,?,?)',
+        (scene_id, tag, comment, json.dumps(context, ensure_ascii=False), _user_id(), datetime.now().strftime('%Y-%m-%d %H:%M')),
+    )
+    conn.commit()
+    row_id = cur.lastrowid
+    conn.close()
+    return jsonify({'ok': True, 'id': row_id})
+
 # ── Backup / Restore ─────────────────────────────────────────
 @app.route('/api/backup')
 def backup():
@@ -1677,6 +1717,7 @@ def backup():
         'ghost_messages': [dict(r) for r in conn.execute('SELECT * FROM ghost_messages').fetchall()],
         'wallet':         [dict(r) for r in conn.execute('SELECT * FROM wallet WHERE user_id=?', (user_id,)).fetchall()],
         'achievement_unlocks': [dict(r) for r in conn.execute('SELECT * FROM achievement_unlocks WHERE user_token=?', (user_id,)).fetchall()],
+        'feedback': [dict(r) for r in conn.execute('SELECT * FROM feedback WHERE user_token=?', (user_id,)).fetchall()],
         'vision_quiz_corrections': [dict(r) for r in conn.execute('SELECT * FROM vision_quiz_corrections').fetchall()],
         'vision_quiz_memory_summaries': [dict(r) for r in conn.execute('SELECT * FROM vision_quiz_memory_summaries').fetchall()],
     }
@@ -1706,7 +1747,7 @@ def restore():
     conn = get_db()
     try:
         admin_ok = _require_admin() is None
-        tables = ['attempts', 'results', 'wallet', 'achievement_unlocks']
+        tables = ['attempts', 'results', 'wallet', 'achievement_unlocks', 'feedback']
         if admin_ok:
             tables = ['decks', 'questions', 'ghost_messages'] + tables + ['vision_quiz_corrections', 'vision_quiz_memory_summaries']
         for table in tables:
@@ -1721,7 +1762,7 @@ def restore():
                 row = dict(row)
                 if table in ('attempts', 'results', 'wallet'):
                     row['user_id'] = user_id
-                if table == 'achievement_unlocks':
+                if table in ('achievement_unlocks', 'feedback'):
                     row['user_token'] = user_id
                 _insert_replace_row(conn, table, row)
         conn.commit()
