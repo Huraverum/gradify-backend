@@ -48,8 +48,11 @@ RATE_LIMITS = {
     'score':    int(os.environ.get('RATE_LIMIT_SCORE', 30)),
     'ai':       int(os.environ.get('RATE_LIMIT_AI',    50)),
     'extract':  int(os.environ.get('RATE_LIMIT_EXTRACT', 5)),
-    'vision_quiz': int(os.environ.get('RATE_LIMIT_VISION_QUIZ', 7)),
+    'vision_quiz': int(os.environ.get('RATE_LIMIT_VISION_QUIZ', 3)),
+    'upload_questions': int(os.environ.get('RATE_LIMIT_UPLOAD_QUESTIONS', 5)),
 }
+
+TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', 7))
 
 def _client_id():
     fwd = request.headers.get('X-Forwarded-For', '')
@@ -103,6 +106,46 @@ def _check_rate(bucket):
     conn.commit()
     conn.close()
     return True, current + 1, limit
+
+def _check_trial(user_id):
+    """Returns dict with status: active|expired|subscribed, days_left, subscribed."""
+    conn = get_db()
+    row = conn.execute('SELECT first_use_at, subscribed FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
+    if not row:
+        first = datetime.now().isoformat(timespec='seconds')
+        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed) VALUES(?, ?, 0)', (user_id, first))
+        conn.commit()
+        conn.close()
+        return {'status': 'active', 'days_left': TRIAL_DAYS, 'subscribed': False, 'first_use_at': first}
+    if row['subscribed']:
+        conn.close()
+        return {'status': 'subscribed', 'days_left': 0, 'subscribed': True, 'first_use_at': row['first_use_at']}
+    try:
+        first_dt = datetime.fromisoformat(row['first_use_at'])
+    except Exception:
+        first_dt = datetime.now()
+    elapsed_days = (datetime.now() - first_dt).days
+    days_left = max(0, TRIAL_DAYS - elapsed_days)
+    conn.close()
+    return {
+        'status': 'active' if days_left > 0 else 'expired',
+        'days_left': days_left,
+        'subscribed': False,
+        'first_use_at': row['first_use_at'],
+    }
+
+def _trial_expired_response():
+    return jsonify({
+        'ok': False,
+        'error': 'trial_ended',
+        'message': '7日間のお試し期間が終了しました。継続利用にはサブスクが必要です。',
+        'subscription_required': True,
+    }), 402
+
+@app.route('/api/trial-status')
+def trial_status():
+    info = _check_trial(_user_id())
+    return jsonify({**info, 'trial_days': TRIAL_DAYS})
 
 def _rate_limit_response(bucket, current, limit):
     return jsonify({
@@ -191,6 +234,27 @@ def init_db():
             user_token TEXT,
             created_at TEXT DEFAULT (datetime('now','localtime'))
         );
+        CREATE TABLE IF NOT EXISTS knowledge_nodes (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            type TEXT NOT NULL,
+            label TEXT NOT NULL,
+            summary TEXT,
+            body TEXT,
+            source_id TEXT,
+            metadata TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS knowledge_edges (
+            id TEXT PRIMARY KEY,
+            user_id TEXT,
+            type TEXT NOT NULL,
+            source TEXT NOT NULL,
+            target TEXT NOT NULL,
+            metadata TEXT,
+            created_at TEXT
+        );
     ''')
     wallet_cols = [r['name'] for r in conn.execute('PRAGMA table_info(wallet)').fetchall()]
     if 'user_id' not in wallet_cols:
@@ -242,6 +306,21 @@ def init_db():
     cols = [r['name'] for r in conn.execute('PRAGMA table_info(questions)').fetchall()]
     if 'mcq_options' not in cols:
         conn.execute('ALTER TABLE questions ADD COLUMN mcq_options TEXT DEFAULT NULL')
+    # migration: per-user deck/question ownership
+    deck_cols = [r['name'] for r in conn.execute('PRAGMA table_info(decks)').fetchall()]
+    if 'owner_id' not in deck_cols:
+        conn.execute('ALTER TABLE decks ADD COLUMN owner_id TEXT DEFAULT NULL')
+    if 'owner_id' not in cols:
+        conn.execute('ALTER TABLE questions ADD COLUMN owner_id TEXT DEFAULT NULL')
+    if 'difficulty' not in cols:
+        conn.execute('ALTER TABLE questions ADD COLUMN difficulty TEXT DEFAULT NULL')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_trial (
+            user_id TEXT PRIMARY KEY,
+            first_use_at TEXT NOT NULL,
+            subscribed INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS vision_quiz_corrections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -482,8 +561,14 @@ VISION_QUIZ_PROMPT = """画像に写っている対象を観察し、断定せ�
 # ── Deck API ──────────────────────────────────────────────────
 @app.route('/api/decks', methods=['GET'])
 def get_decks():
+    user_id = _user_id()
     conn = get_db()
-    rows = conn.execute('SELECT d.*, COUNT(q.id) as q_count FROM decks d LEFT JOIN questions q ON d.id=q.deck_id GROUP BY d.id ORDER BY d.created_at DESC').fetchall()
+    rows = conn.execute('''
+        SELECT d.*, COUNT(q.id) as q_count FROM decks d
+        LEFT JOIN questions q ON d.id=q.deck_id
+        WHERE d.owner_id IS NULL OR d.owner_id=?
+        GROUP BY d.id ORDER BY d.created_at DESC
+    ''', (user_id,)).fetchall()
     conn.close()
     return jsonify([dict(r) for r in rows])
 
@@ -495,9 +580,10 @@ def create_deck():
     name = (d.get('name') or '').strip()
     if not name:
         return jsonify({'error': 'デッキ名は必須です'}), 400
+    user_id = _user_id()
     conn = get_db()
-    cur = conn.execute('INSERT INTO decks(name,description,category,created_at) VALUES(?,?,?,?)',
-        (name, d.get('description',''), d.get('category',''), datetime.now().strftime('%Y-%m-%d %H:%M')))
+    cur = conn.execute('INSERT INTO decks(name,description,category,owner_id,created_at) VALUES(?,?,?,?,?)',
+        (name, d.get('description',''), d.get('category',''), user_id, datetime.now().strftime('%Y-%m-%d %H:%M')))
     new_id = cur.lastrowid
     conn.commit()
     conn.close()
@@ -507,48 +593,77 @@ def create_deck():
 def delete_deck(deck_id):
     denied = _require_admin()
     if denied: return denied
+    user_id = _user_id()
     conn = get_db()
+    deck = conn.execute('SELECT owner_id FROM decks WHERE id=?', (deck_id,)).fetchone()
+    if not deck:
+        conn.close()
+        return jsonify({'error': 'deck not found'}), 404
+    if deck['owner_id'] and deck['owner_id'] != user_id:
+        conn.close()
+        return jsonify({'error': 'forbidden'}), 403
     conn.execute('DELETE FROM questions WHERE deck_id=?', (deck_id,))
     conn.execute('DELETE FROM decks WHERE id=?', (deck_id,))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
 
+@app.route('/api/decks/claim-public', methods=['POST'])
+def claim_public_decks():
+    user_id = _user_id()
+    conn = get_db()
+    nd = conn.execute('UPDATE decks SET owner_id=? WHERE owner_id IS NULL', (user_id,)).rowcount
+    nq = conn.execute('UPDATE questions SET owner_id=? WHERE owner_id IS NULL', (user_id,)).rowcount
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'decks': nd, 'questions': nq})
+
 # ── Question API ──────────────────────────────────────────────
 @app.route('/api/decks/<int:deck_id>/questions', methods=['GET'])
 def get_questions(deck_id):
     user_id = _user_id()
+    conn = get_db()
+    deck = conn.execute('SELECT owner_id FROM decks WHERE id=?', (deck_id,)).fetchone()
+    if not deck:
+        conn.close()
+        return jsonify({'error': 'deck not found'}), 404
+    if deck['owner_id'] and deck['owner_id'] != user_id:
+        conn.close()
+        return jsonify({'error': 'forbidden'}), 403
     category = request.args.get('category', '')
     limit    = request.args.get('limit', type=int)
     shuffle  = request.args.get('shuffle', '0') == '1'
     mode     = request.args.get('mode', '')   # 'weak' | 'new' | ''
-    conn = get_db()
 
+    difficulty = (request.args.get('difficulty') or '').strip()
     cat_clause  = ' AND q.category=?' if category else ''
     cat_params  = [category]              if category else []
+    diff_clause = ' AND q.difficulty=?' if difficulty else ''
+    diff_params = [difficulty]            if difficulty else []
 
     if mode == 'weak':
         # Attempted questions, lowest avg score first
         sql  = f'''SELECT q.* FROM questions q
                    JOIN attempts a ON a.question_id = q.id
-                   WHERE q.deck_id=? AND a.user_id=? {cat_clause}
+                   WHERE q.deck_id=? AND a.user_id=? {cat_clause}{diff_clause}
                    GROUP BY q.id
                    ORDER BY AVG(a.score) ASC'''
-        rows = conn.execute(sql, [deck_id, user_id] + cat_params).fetchall()
+        rows = conn.execute(sql, [deck_id, user_id] + cat_params + diff_params).fetchall()
     elif mode == 'new':
         # Questions with zero attempts
         sql  = f'''SELECT q.* FROM questions q
                    WHERE q.deck_id=?
                    AND q.id NOT IN (SELECT DISTINCT question_id FROM attempts WHERE user_id=?)
-                   {cat_clause}'''
-        rows = conn.execute(sql, [deck_id, user_id] + cat_params).fetchall()
+                   {cat_clause}{diff_clause}'''
+        rows = conn.execute(sql, [deck_id, user_id] + cat_params + diff_params).fetchall()
         if shuffle:
             import random; random.shuffle(rows := list(rows))
     else:
         cat_sql = ' AND category=?' if category else ''
+        diff_sql = ' AND difficulty=?' if difficulty else ''
         order   = ' ORDER BY RANDOM()' if shuffle else ' ORDER BY id ASC'
-        sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{order}'
-        rows = conn.execute(sql, [deck_id] + cat_params).fetchall()
+        sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{diff_sql}{order}'
+        rows = conn.execute(sql, [deck_id] + cat_params + diff_params).fetchall()
 
     conn.close()
     result = []
@@ -564,19 +679,31 @@ def get_questions(deck_id):
 def add_question(deck_id):
     denied = _require_admin()
     if denied: return denied
+    user_id = _user_id()
     d = request.get_json(force=True)
     question = (d.get('question') or '').strip()
     if not question:
         return jsonify({'error': '問題文は必須です'}), 400
     conn = get_db()
+    deck = conn.execute('SELECT owner_id FROM decks WHERE id=?', (deck_id,)).fetchone()
+    if not deck:
+        conn.close()
+        return jsonify({'error': 'deck not found'}), 404
+    if deck['owner_id'] and deck['owner_id'] != user_id:
+        conn.close()
+        return jsonify({'error': 'forbidden'}), 403
+    owner = deck['owner_id'] or user_id
     mcq_options = d.get('mcq_options')  # pre-cached options from push script
+    difficulty = (d.get('difficulty') or '').strip() or None
     cur = conn.execute(
-        'INSERT INTO questions(deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,mcq_options,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO questions(deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,mcq_options,owner_id,difficulty,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
         (deck_id, (d.get('category') or '').strip(), question,
          d.get('model_answer', ''),
          json.dumps(d.get('key_points', []), ensure_ascii=False),
          d.get('guideline_ref', ''), d.get('flowchart', ''),
          json.dumps(mcq_options) if mcq_options else None,
+         owner,
+         difficulty,
          datetime.now().strftime('%Y-%m-%d %H:%M')))
     conn.commit()
     conn.close()
@@ -600,12 +727,14 @@ def update_question(q_id):
     if not question:
         return jsonify({'error': '問題文は必須です'}), 400
     conn = get_db()
+    difficulty = (d.get('difficulty') or '').strip() or None
     conn.execute(
-        'UPDATE questions SET category=?,question=?,model_answer=?,key_points=?,guideline_ref=?,flowchart=? WHERE id=?',
+        'UPDATE questions SET category=?,question=?,model_answer=?,key_points=?,guideline_ref=?,flowchart=?,difficulty=? WHERE id=?',
         ((d.get('category') or '').strip(), question,
          d.get('model_answer', ''),
          json.dumps(d.get('key_points', []), ensure_ascii=False),
-         d.get('guideline_ref', ''), d.get('flowchart', ''), q_id))
+         d.get('guideline_ref', ''), d.get('flowchart', ''),
+         difficulty, q_id))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
@@ -728,11 +857,11 @@ def score_sync():
     _save_attempt(qid, result, answer, user_id)
     return jsonify(result)
 
-def _save_attempt(qid, d, answer, user_id=None):
+def _save_attempt(qid, d, answer, user_id=None, question_row=None):
     user_id = user_id or _user_id()
     conn = get_db()
     score = d.get('score', 0)
-    conn.execute(
+    cur = conn.execute(
         'INSERT INTO attempts(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at,user_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
         (qid, score, d.get('grade',''),
          answer, d.get('model_answer',''),
@@ -741,6 +870,7 @@ def _save_attempt(qid, d, answer, user_id=None):
          json.dumps(d.get('missed',[]),  ensure_ascii=False),
          d.get('feedback',''), d.get('advice',''),
          datetime.now().strftime('%Y-%m-%d %H:%M'), user_id))
+    attempt_id = cur.lastrowid
     conn.execute('''INSERT INTO results(user_id,question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,saved_at)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(user_id, question_id) DO UPDATE SET
@@ -755,8 +885,412 @@ def _save_attempt(qid, d, answer, user_id=None):
          json.dumps(d.get('missed',[]),   ensure_ascii=False),
          d.get('feedback',''), d.get('advice',''),
          datetime.now().strftime('%Y-%m-%d %H:%M')))
+    if question_row is None:
+        try:
+            question_row = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
+        except Exception:
+            question_row = None
+    if question_row is not None:
+        try:
+            _record_attempt_graph(conn, qid=qid, attempt_id=attempt_id, question_row=question_row,
+                                  result=d, answer=answer, user_id=user_id)
+        except Exception as e:
+            print('[knowledge] attempt graph failed:', e)
     conn.commit()
     conn.close()
+
+
+# ── Knowledge Graph helpers ───────────────────────────────────
+def _now_iso():
+    return datetime.now().isoformat(timespec='seconds')
+
+def _kg_meta(value):
+    return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
+
+def _save_kg_node(conn, *, node_id, user_id, type_, label, summary='', body='', source_id='', metadata=None):
+    now = _now_iso()
+    existing = conn.execute('SELECT created_at FROM knowledge_nodes WHERE id=?', (node_id,)).fetchone()
+    created = existing['created_at'] if existing else now
+    conn.execute("""
+        INSERT INTO knowledge_nodes(id,user_id,type,label,summary,body,source_id,metadata,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+            label=excluded.label, summary=excluded.summary, body=excluded.body,
+            source_id=excluded.source_id, metadata=excluded.metadata, updated_at=excluded.updated_at
+    """, (node_id, user_id, type_, (label or type_)[:180], (summary or '')[:500], body or '', source_id or '',
+          _kg_meta(metadata), created, now))
+    return node_id
+
+def _save_kg_edge(conn, *, user_id, type_, source, target, metadata=None):
+    edge_id = f"{type_}:{source}:{target}"
+    now = _now_iso()
+    conn.execute("""
+        INSERT OR IGNORE INTO knowledge_edges(id,user_id,type,source,target,metadata,created_at)
+        VALUES(?,?,?,?,?,?,?)
+    """, (edge_id, user_id, type_, source, target, _kg_meta(metadata), now))
+    return edge_id
+
+def _kg_extract_candidates(text):
+    clean = re.sub(r'\s+', ' ', (text or '').strip())
+    if not clean:
+        return []
+    hits = []
+    patterns = [
+        r'\b[A-Z]{2,}(?:\s?\d{1,3}(?:-\d{1,3})?)?\b',
+        r'\b[A-Z]{1,4}\.\d{1,3}\b',
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, clean):
+            val = m.group(0).strip()
+            if val and val not in hits:
+                hits.append(val)
+    return hits[:6]
+
+def _kg_question_key_points(question_row):
+    try:
+        kps = json.loads(question_row['key_points'] or '[]')
+    except Exception:
+        return []
+    points = []
+    for item in kps:
+        if isinstance(item, dict) and item.get('t'):
+            text = re.sub(r'\s+', ' ', str(item['t']).strip())
+            if text:
+                points.append(text)
+    return points
+
+def _build_concept_card(question_row, label):
+    question_text = question_row['question'] or ''
+    model_answer = question_row['model_answer'] or ''
+    guideline_ref = question_row['guideline_ref'] or ''
+    points = _kg_question_key_points(question_row)
+    drug_hits = _kg_extract_candidates(question_text + '\n' + model_answer)
+    trial_hits = _kg_extract_candidates(guideline_ref + '\n' + model_answer)
+    summary = question_row['category'] or label or '関連知識'
+    lines = []
+    if question_text:
+        lines.append(f'問題: {question_text}')
+    if drug_hits:
+        lines.append('薬剤・レジメン候補: ' + ' / '.join(drug_hits))
+    if points:
+        lines.append('要点: ' + ' / '.join(points[:3]))
+    if guideline_ref:
+        lines.append('根拠: ' + guideline_ref)
+    if trial_hits:
+        lines.append('試験・略称候補: ' + ' / '.join(trial_hits))
+    body = '\n'.join(lines)
+    metadata = {
+        'category': question_row['category'] or '',
+        'questionId': question_row['id'],
+        'question': question_text[:260],
+        'guidelineRef': guideline_ref,
+        'drugCandidates': drug_hits,
+        'trialCandidates': trial_hits,
+    }
+    return summary, body, metadata
+
+def _concept_node(conn, user_id, label, *, source_id='', metadata=None, summary='関連知識', body=''):
+    clean = re.sub(r'\s+', ' ', (label or '').strip())
+    if not clean:
+        return None
+    slug = re.sub(r'[^0-9A-Za-zぁ-んァ-ン一-龥ー]+', '-', clean).strip('-').lower()[:80]
+    if not slug:
+        import uuid as _uuid
+        slug = _uuid.uuid4().hex[:8]
+    node_id = f"concept:{user_id}:{slug}"
+    return _save_kg_node(conn, node_id=node_id, user_id=user_id, type_='concept',
+                         label=clean, summary=summary, body=body, source_id=source_id, metadata=metadata or {})
+
+def _record_attempt_graph(conn, *, qid, attempt_id, question_row, result, answer, user_id):
+    q_node = f"question:{qid}"
+    answer_node = f"answer:user:{attempt_id}"
+    agent_node = 'agent:claude'
+    question_text = question_row['question'] or ''
+    model_answer = result.get('model_answer') or question_row['model_answer'] or ''
+    category = question_row['category'] or ''
+    advice = result.get('advice') or ''
+    feedback = result.get('feedback') or ''
+
+    combined_body_parts = []
+    if answer:
+        combined_body_parts.append(f"【あなたの回答】\n{answer}")
+    if model_answer:
+        combined_body_parts.append(f"【模範解答】\n{model_answer}")
+    if advice:
+        combined_body_parts.append(f"【AIアドバイス】\n{advice}")
+    combined_body = '\n\n'.join(combined_body_parts)
+
+    _save_kg_node(conn, node_id=q_node, user_id=user_id, type_='question',
+                  label=question_text[:80] or f'問題 {qid}', summary=category,
+                  body=question_text, source_id=str(qid), metadata={'questionId': qid, 'category': category})
+    is_mcq = answer in ('5択:正解', '5択:不正解')
+    if is_mcq:
+        answer_label = '回答 ○' if answer == '5択:正解' else '回答 ×'
+    else:
+        answer_label = f"回答 {result.get('grade','')}".strip()
+    _save_kg_node(conn, node_id=answer_node, user_id=user_id, type_='answer',
+                  label=answer_label, summary=feedback,
+                  body=combined_body, source_id=str(attempt_id),
+                  metadata={'questionId': qid, 'attemptId': attempt_id, 'score': result.get('score'), 'grade': result.get('grade'), 'agent': 'claude', 'isMcq': is_mcq})
+    _save_kg_node(conn, node_id=agent_node, user_id=user_id, type_='agent',
+                  label='Claude', summary='採点・解説エージェント', metadata={'provider': 'anthropic'})
+
+    _save_kg_edge(conn, user_id=user_id, type_='generated_from', source=answer_node, target=q_node)
+    _save_kg_edge(conn, user_id=user_id, type_='explains', source=agent_node, target=answer_node)
+
+    concept_labels = [category]
+    concept_labels += result.get('covered') or []
+    concept_labels += result.get('partial') or []
+    concept_labels += result.get('missed') or []
+    seen = set()
+    for label in concept_labels:
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        summary, body, meta = _build_concept_card(question_row, label)
+        meta.update({'questionId': qid, 'conceptLabel': label, 'attemptId': attempt_id})
+        concept = _concept_node(conn, user_id, label, source_id=str(qid), metadata=meta, summary=summary, body=body)
+        if not concept:
+            continue
+        _save_kg_edge(conn, user_id=user_id, type_='relates_to', source=q_node, target=concept)
+        if label in (result.get('missed') or []) or label in (result.get('partial') or []):
+            _save_kg_edge(conn, user_id=user_id, type_='confused_with', source=answer_node, target=concept)
+        else:
+            _save_kg_edge(conn, user_id=user_id, type_='explains', source=answer_node, target=concept)
+
+def _backfill_knowledge_graph_for_user(user_id):
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT a.*, q.id AS q_id, q.deck_id, q.category, q.question, q.model_answer AS q_model_answer,
+               q.key_points, q.guideline_ref, q.flowchart, q.created_at AS q_created_at
+        FROM attempts a
+        JOIN questions q ON q.id = a.question_id
+        WHERE a.user_id=?
+        ORDER BY a.id ASC
+    """, (user_id,)).fetchall()
+    made = 0
+    for r in rows:
+        qrow = {
+            'id': r['q_id'],
+            'deck_id': r['deck_id'],
+            'category': r['category'],
+            'question': r['question'],
+            'model_answer': r['q_model_answer'],
+            'key_points': r['key_points'],
+            'guideline_ref': r['guideline_ref'],
+            'flowchart': r['flowchart'],
+            'created_at': r['q_created_at'],
+        }
+        result = {
+            'score': r['score'],
+            'grade': r['grade'],
+            'model_answer': r['model_answer'] or r['q_model_answer'] or '',
+            'covered': json.loads(r['covered'] or '[]'),
+            'partial': json.loads(r['partial'] or '[]'),
+            'missed': json.loads(r['missed'] or '[]'),
+            'feedback': r['feedback'] or '',
+            'advice': r['advice'] or '',
+        }
+        try:
+            _record_attempt_graph(conn, qid=r['question_id'], attempt_id=r['id'], question_row=qrow,
+                                  result=result, answer=r['answer'] or '', user_id=user_id)
+            made += 1
+        except Exception as e:
+            print('[knowledge] backfill row failed:', e)
+    conn.commit()
+    conn.close()
+    return made
+
+def _row_to_kg_node(r):
+    return {
+        'id': r['id'],
+        'userId': r['user_id'] or '',
+        'type': r['type'],
+        'label': r['label'],
+        'summary': r['summary'] or '',
+        'body': r['body'] or '',
+        'sourceId': r['source_id'] or '',
+        'metadata': json.loads(r['metadata'] or '{}'),
+        'createdAt': r['created_at'] or '',
+        'updatedAt': r['updated_at'] or '',
+    }
+
+def _row_to_kg_edge(r):
+    return {
+        'id': r['id'],
+        'userId': r['user_id'] or '',
+        'type': r['type'],
+        'source': r['source'],
+        'target': r['target'],
+        'metadata': json.loads(r['metadata'] or '{}'),
+        'createdAt': r['created_at'] or '',
+    }
+
+@app.route('/api/knowledge-graph/backfill', methods=['POST'])
+def backfill_knowledge_graph():
+    made = _backfill_knowledge_graph_for_user(_user_id())
+    return jsonify({'ok': True, 'attempts': made})
+
+@app.route('/api/knowledge-graph')
+def get_knowledge_graph():
+    user_id = _user_id()
+    try:
+        limit = max(20, min(int(request.args.get('limit', 240)), 500))
+    except Exception:
+        limit = 240
+    deck_id = (request.args.get('deck_id') or '').strip()
+    expand_bridges = (request.args.get('expand') or '').strip() == '1'
+    bridges_info = {'count': 0, 'concept_ids': [], 'other_deck_names': []}
+
+    def load_graph(uid):
+        conn = get_db()
+        if deck_id:
+            q_rows = conn.execute('SELECT id FROM questions WHERE deck_id=?', (deck_id,)).fetchall()
+            deck_qids = {r['id'] for r in q_rows}
+            q_node_ids = {f"question:{qid}" for qid in deck_qids}
+            if not q_node_ids:
+                conn.close()
+                return [], []
+            ph_q = ','.join(['?'] * len(q_node_ids))
+            seed_edges = conn.execute(
+                f"SELECT source, target FROM knowledge_edges WHERE user_id=? AND (source IN ({ph_q}) OR target IN ({ph_q}))",
+                [uid, *q_node_ids, *q_node_ids]
+            ).fetchall()
+            related_ids = set(q_node_ids)
+            for e in seed_edges:
+                related_ids.add(e['source'])
+                related_ids.add(e['target'])
+            related_ids.add('agent:claude')
+
+            in_deck_concepts = {nid for nid in related_ids if nid.startswith('concept:')}
+            bridge_external_q_ids = set()
+            bridge_concept_ids = set()
+            if in_deck_concepts:
+                ph_c = ','.join(['?'] * len(in_deck_concepts))
+                bridge_edges = conn.execute(
+                    f"SELECT source, target FROM knowledge_edges WHERE user_id=? AND (source IN ({ph_c}) OR target IN ({ph_c}))",
+                    [uid, *in_deck_concepts, *in_deck_concepts]
+                ).fetchall()
+                for e in bridge_edges:
+                    for endpoint in (e['source'], e['target']):
+                        if endpoint.startswith('question:') and endpoint not in q_node_ids:
+                            bridge_external_q_ids.add(endpoint)
+                            for c in (e['source'], e['target']):
+                                if c in in_deck_concepts:
+                                    bridge_concept_ids.add(c)
+            bridges_info['count'] = len(bridge_external_q_ids)
+            bridges_info['concept_ids'] = sorted(bridge_concept_ids)
+            if bridge_external_q_ids:
+                ext_qids = [int(x.split(':', 1)[1]) for x in bridge_external_q_ids if x.split(':', 1)[1].isdigit()]
+                if ext_qids:
+                    ph_ext = ','.join(['?'] * len(ext_qids))
+                    name_rows = conn.execute(
+                        f"SELECT DISTINCT d.name FROM decks d JOIN questions q ON q.deck_id=d.id WHERE q.id IN ({ph_ext})",
+                        ext_qids
+                    ).fetchall()
+                    bridges_info['other_deck_names'] = [r['name'] for r in name_rows]
+
+            if expand_bridges and bridge_external_q_ids:
+                related_ids |= bridge_external_q_ids
+                ph_b = ','.join(['?'] * len(bridge_external_q_ids))
+                more_edges = conn.execute(
+                    f"SELECT source, target FROM knowledge_edges WHERE user_id=? AND (source IN ({ph_b}) OR target IN ({ph_b}))",
+                    [uid, *bridge_external_q_ids, *bridge_external_q_ids]
+                ).fetchall()
+                for e in more_edges:
+                    related_ids.add(e['source'])
+                    related_ids.add(e['target'])
+
+            ph_n = ','.join(['?'] * len(related_ids))
+            nodes = conn.execute(
+                f"SELECT * FROM knowledge_nodes WHERE (user_id=? OR type='agent') AND id IN ({ph_n}) ORDER BY updated_at DESC LIMIT ?",
+                [uid, *related_ids, limit]
+            ).fetchall()
+            final_ids = [r['id'] for r in nodes]
+            edges = []
+            if final_ids:
+                ph_f = ','.join(['?'] * len(final_ids))
+                edges = conn.execute(
+                    f"SELECT * FROM knowledge_edges WHERE user_id=? AND source IN ({ph_f}) AND target IN ({ph_f}) ORDER BY created_at DESC LIMIT ?",
+                    [uid, *final_ids, *final_ids, limit * 2]
+                ).fetchall()
+            conn.close()
+            return nodes, edges
+        nodes = conn.execute("""
+            SELECT * FROM knowledge_nodes
+            WHERE user_id=? OR type='agent'
+            ORDER BY updated_at DESC
+            LIMIT ?
+        """, (uid, limit)).fetchall()
+        node_ids = [r['id'] for r in nodes]
+        edges = []
+        if node_ids:
+            ph = ','.join(['?'] * len(node_ids))
+            edges = conn.execute(f"""
+                SELECT * FROM knowledge_edges
+                WHERE user_id=? AND source IN ({ph}) AND target IN ({ph})
+                ORDER BY created_at DESC
+                LIMIT ?
+            """, [uid, *node_ids, *node_ids, limit * 2]).fetchall()
+        conn.close()
+        return nodes, edges
+
+    def has_learning_nodes(rows):
+        return any(r['type'] in ('question', 'image', 'answer', 'correction') for r in rows)
+
+    try:
+        nodes, edges = load_graph(user_id)
+        if not has_learning_nodes(nodes):
+            _backfill_knowledge_graph_for_user(user_id)
+            nodes, edges = load_graph(user_id)
+        return jsonify({
+            'nodes': [_row_to_kg_node(r) for r in nodes],
+            'edges': [_row_to_kg_edge(r) for r in edges],
+            'bridges': bridges_info if deck_id else None,
+        })
+    except Exception as e:
+        print('[knowledge] get_knowledge_graph failed:', e)
+        return jsonify({'ok': False, 'error': 'knowledge_graph_failed', 'message': str(e), 'nodes': [], 'edges': [], 'bridges': None}), 500
+
+@app.route('/api/knowledge-graph/correction', methods=['POST'])
+def create_knowledge_correction():
+    import uuid as _uuid
+    d = request.get_json(force=True)
+    qid = d.get('question_id')
+    text = (d.get('correction') or '').strip()
+    if not qid or not text:
+        return jsonify({'error': 'question_id and correction are required'}), 400
+    user_id = _user_id()
+    conn = get_db()
+    q = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
+    if not q:
+        conn.close()
+        return jsonify({'error': '問題が見つかりません'}), 404
+    node_id = f"correction:{_uuid.uuid4().hex}"
+    q_node = f"question:{qid}"
+    summary, body, meta = _build_concept_card(q, q['category'] or '')
+    _save_kg_node(conn, node_id=q_node, user_id=user_id, type_='question',
+                  label=(q['question'] or '')[:80] or f'問題 {qid}', summary=q['category'] or '',
+                  body=q['question'] or '', source_id=str(qid),
+                  metadata={'questionId': qid, 'category': q['category'] or '', 'summaryHint': summary, 'bodyHint': body[:500], **meta})
+    _save_kg_node(conn, node_id=node_id, user_id=user_id, type_='correction',
+                  label='ユーザー修正', summary=text[:120], body=text, source_id=str(qid),
+                  metadata={'questionId': qid, 'grade': d.get('grade'), 'score': d.get('score')})
+    _save_kg_edge(conn, user_id=user_id, type_='corrected_by', source=q_node, target=node_id)
+    _save_kg_edge(conn, user_id=user_id, type_='relates_to', source=node_id, target=q_node)
+    concepts = d.get('concepts') or []
+    if isinstance(concepts, str):
+        concepts = [concepts]
+    base_labels = [q['category'] or ''] + [c for c in concepts if isinstance(c, str)]
+    for label in base_labels:
+        meta_iter = dict(meta)
+        meta_iter.update({'questionId': qid, 'conceptLabel': label})
+        concept = _concept_node(conn, user_id, label, source_id=str(qid), metadata=meta_iter, summary=summary, body=body)
+        if concept:
+            _save_kg_edge(conn, user_id=user_id, type_='relates_to', source=node_id, target=concept)
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'node': {'id': node_id, 'type': 'correction', 'label': 'ユーザー修正'}})
 
 # ── Results / Attempts API ────────────────────────────────────
 @app.route('/api/results')
@@ -814,6 +1348,9 @@ def upload_questions():
     user_key = ANTHROPIC_API_KEY
     if not user_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
+    trial = _check_trial(_user_id())
+    if trial['status'] == 'expired':
+        return _trial_expired_response()
     ok, current, limit = _check_rate('extract')
     if not ok:
         return _rate_limit_response('extract', current, limit)
@@ -1067,46 +1604,94 @@ def _normalize_vision_quiz_result(result):
         ],
     }
 
+def _vision_quiz_fallback():
+    return {
+        'ok': True,
+        'imageId': '',
+        'fallback': True,
+        'question': {
+            'category': '一般',
+            'question': '画像から問題を生成できませんでした。別の画像でお試しください。',
+            'choices': ['再試行', 'スキップ', '別の写真を撮る', 'キャンセル'],
+            'correctIndex': 0,
+            'explanation': 'AIが画像を解析できなかったため、フォールバック問題を表示しています。',
+        },
+    }
+
 @app.route('/api/vision-quiz', methods=['POST'])
 def vision_quiz():
-    user_key = ANTHROPIC_API_KEY
-    if not user_key:
-        return jsonify({'error': 'APIキーが未設定です'}), 401
-    ok, current, limit = _check_rate('vision_quiz')
-    if not ok:
-        return _rate_limit_response('vision_quiz', current, limit)
-    # マルチパート (file) or JSON (image_b64) の両方受け付け
-    image_bytes = None
-    mt = 'image/jpeg'
-    f = request.files.get('file')
-    if f:
-        name = (f.filename or '').lower()
-        if not name.endswith(('.jpg','.jpeg','.png','.webp','.gif')):
-            return jsonify({'error': '画像のみ対応（jpg/png/webp/gif）'}), 400
-        image_bytes = f.read()
-        mt = ('image/jpeg' if name.endswith(('.jpg','.jpeg')) else
-              'image/png'  if name.endswith('.png')  else
-              'image/webp' if name.endswith('.webp') else 'image/gif')
-    else:
-        body = request.get_json(silent=True) or {}
-        b64 = body.get('image_b64', '')
-        if not b64:
-            return jsonify({'error': 'ファイルがありません'}), 400
-        mt = body.get('mime_type', 'image/jpeg')
-        try:
-            image_bytes = base64.standard_b64decode(b64)
-        except Exception:
-            return jsonify({'error': 'base64デコード失敗'}), 400
-
+    import traceback
     try:
-        result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key))
-        memory_prompt = _vision_quiz_memory_prompt(result)
-        if memory_prompt:
-            result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key, memory_prompt))
-        image_id = hashlib.sha256(image_bytes).hexdigest()[:24]
+        user_key = ANTHROPIC_API_KEY
+        if not user_key:
+            return jsonify({'ok': False, 'error': 'api_key_missing', 'message': 'APIキーが未設定です'}), 401
+        trial = _check_trial(_user_id())
+        if trial['status'] == 'expired':
+            return _trial_expired_response()
+        try:
+            ok, current, limit = _check_rate('vision_quiz')
+        except Exception as e:
+            print('[vision-quiz] rate check failed:', e)
+            ok, current, limit = True, 0, 0
+        if not ok:
+            return _rate_limit_response('vision_quiz', current, limit)
+
+        image_bytes = None
+        mt = 'image/jpeg'
+        try:
+            f = request.files.get('file')
+        except Exception:
+            f = None
+        if f:
+            name = (f.filename or '').lower()
+            if not name.endswith(('.jpg','.jpeg','.png','.webp','.gif')):
+                return jsonify({'ok': False, 'error': 'invalid_image', 'message': '画像のみ対応（jpg/png/webp/gif）'}), 400
+            try:
+                image_bytes = f.read()
+            except Exception as e:
+                return jsonify({'ok': False, 'error': 'read_failed', 'message': '画像の読み取りに失敗', 'detail': str(e)}), 400
+            mt = ('image/jpeg' if name.endswith(('.jpg','.jpeg')) else
+                  'image/png'  if name.endswith('.png')  else
+                  'image/webp' if name.endswith('.webp') else 'image/gif')
+        else:
+            body = request.get_json(silent=True) or {}
+            b64 = body.get('image_b64', '')
+            if not b64:
+                return jsonify({'ok': False, 'error': 'no_file', 'message': 'ファイルがありません'}), 400
+            mt = body.get('mime_type', 'image/jpeg')
+            try:
+                image_bytes = base64.standard_b64decode(b64)
+            except Exception as e:
+                return jsonify({'ok': False, 'error': 'b64_decode_failed', 'message': 'base64デコード失敗', 'detail': str(e)}), 400
+
+        if not image_bytes:
+            return jsonify({'ok': False, 'error': 'empty_image', 'message': '画像データが空です'}), 400
+
+        try:
+            result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key))
+        except Exception as e:
+            print('[vision-quiz] AI call/normalize failed:', e)
+            traceback.print_exc()
+            fb = _vision_quiz_fallback()
+            fb['error'] = 'ai_call_failed'
+            fb['message'] = '画像解析中にエラーが発生しました（フォールバック問題を返却）'
+            fb['detail'] = str(e)
+            return jsonify(fb), 200
+        try:
+            memory_prompt = _vision_quiz_memory_prompt(result)
+            if memory_prompt:
+                result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key, memory_prompt))
+        except Exception as e:
+            print('[vision-quiz] memory pass failed (ignored):', e)
+        try:
+            image_id = hashlib.sha256(image_bytes).hexdigest()[:24]
+        except Exception:
+            image_id = ''
         return jsonify({'ok': True, 'imageId': image_id, **result})
     except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
+        print('[vision-quiz] unhandled exception:', e)
+        traceback.print_exc()
+        return jsonify({'ok': False, 'error': 'vision_quiz_failed', 'message': '画像解析中にエラーが発生しました', 'detail': str(e)}), 500
 
 @app.route('/api/vision-quiz/correction', methods=['POST'])
 def save_vision_quiz_correction():
@@ -1646,7 +2231,7 @@ def score_mcq():
     return jsonify(result)
 
 # ── Companion reaction ───────────────────────────────────────
-COMPANION_SYSTEM = """あなたは旅の仲間の小動物です。プレイヤーの言葉に対して1〜2文で短く反応してください。
+COMPANION_SYSTEM_DEFAULT = """あなたは旅の仲間の小動物です。プレイヤーの言葉に対して1〜2文で短く反応してください。
 
 キャラクター:
 - 好奇心旺盛で忠実、時々ちょっとズレた反応をする
@@ -1657,10 +2242,50 @@ COMPANION_SYSTEM = """あなたは旅の仲間の小動物です。プレイヤ�
 - 絵文字は使わない
 - 返答はかならず1〜2文のみ"""
 
+COMPANION_SYSTEM_SHISHIN = {
+    'genbu':  """あなたは北の守護神「玄武」。亀と蛇が一体となった古の神獣。
+プレイヤーの言葉に対し、厳かで重みのある口調で1〜2文だけ返してください。
+
+口調:
+- 「〜よ」「〜なり」「〜なり、覚悟せよ」など古風で荘厳
+- 一人称は「我」、二人称は「そなた」または「汝」
+- 守りと忍耐を尊ぶ。動じず、深く落ち着いた語り
+- 絵文字や軽口は禁止
+- かならず1〜2文のみ""",
+    'suzaku': """あなたは南の守護神「朱雀」。再生の朱火を纏う神鳥。
+プレイヤーの言葉に対し、厳かで誇り高い口調で1〜2文だけ返してください。
+
+口調:
+- 「〜なり」「〜と燃ゆ」「〜たれ」など荘厳で炎を思わせる語り
+- 一人称は「我」、二人称は「そなた」
+- 灰となりてもまた立ち上がる、再起と情熱の象徴
+- 絵文字や軽口は禁止
+- かならず1〜2文のみ""",
+    'byakko': """あなたは西の守護神「白虎」。研ぎ澄まされた爪と眼を持つ神虎。
+プレイヤーの言葉に対し、厳かで鋭い口調で1〜2文だけ返してください。
+
+口調:
+- 「〜ぞ」「〜なり」「見極めよ」など短く力強い荘厳語
+- 一人称は「我」、二人称は「そなた」
+- 知の鋭さと直感を尊ぶ。冷静で揺るがない
+- 絵文字や軽口は禁止
+- かならず1〜2文のみ""",
+    'seiryu': """あなたは東の守護神「青龍」。知の流れを操る蒼き龍。
+プレイヤーの言葉に対し、厳かで悠然とした口調で1〜2文だけ返してください。
+
+口調:
+- 「〜なり」「流転は道なり」「悟りたまえ」など水の流れのような語り
+- 一人称は「我」、二人称は「そなた」
+- 知と道理を司る。穏やかながら底知れぬ深さ
+- 絵文字や軽口は禁止
+- かならず1〜2文のみ""",
+}
+
 @app.route('/api/companion/react', methods=['POST'])
 def companion_react():
     d = request.get_json(force=True)
     player_input = (d.get('player_input') or '').strip()
+    companion = (d.get('companion') or '').strip().lower()
     api_key = ANTHROPIC_API_KEY
     if not player_input:
         return jsonify({'error': 'player_input required'}), 400
@@ -1669,12 +2294,13 @@ def companion_react():
     ok, current, limit = _check_rate('ai')
     if not ok:
         return _rate_limit_response('ai', current, limit)
+    system_prompt = COMPANION_SYSTEM_SHISHIN.get(companion, COMPANION_SYSTEM_DEFAULT)
     try:
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001',
-            max_tokens=120,
-            system=COMPANION_SYSTEM,
+            max_tokens=160,
+            system=system_prompt,
             messages=[{'role': 'user', 'content': player_input}])
         return jsonify({'reaction': msg.content[0].text.strip()})
     except Exception as e:
@@ -1750,6 +2376,22 @@ def restore():
         tables = ['attempts', 'results', 'wallet', 'achievement_unlocks', 'feedback']
         if admin_ok:
             tables = ['decks', 'questions', 'ghost_messages'] + tables + ['vision_quiz_corrections', 'vision_quiz_memory_summaries']
+        elif data.get('decks') or data.get('questions'):
+            # 個人復元でも教材本体はマージする。
+            # iPhone内バックアップに decks/questions が入っていても、ここを外すと「復元完了」なのに問題が戻らない。
+            tables = ['decks', 'questions', 'ghost_messages'] + tables
+
+        restored_counts = {}
+
+        # ユーザー固有データは置き換え、教材本体は通常ユーザーではマージする。
+        for table in tables:
+            if table in ('attempts', 'results', 'wallet'):
+                conn.execute(f'DELETE FROM {table} WHERE user_id=?', (user_id,))
+            elif table in ('achievement_unlocks', 'feedback'):
+                conn.execute(f'DELETE FROM {table} WHERE user_token=?', (user_id,))
+            elif admin_ok:
+                conn.execute(f'DELETE FROM {table}')
+
         for table in tables:
             rows = data.get(table, [])
             if rows is None:
@@ -1765,8 +2407,9 @@ def restore():
                 if table in ('achievement_unlocks', 'feedback'):
                     row['user_token'] = user_id
                 _insert_replace_row(conn, table, row)
+                restored_counts[table] = restored_counts.get(table, 0) + 1
         conn.commit()
-        return jsonify({'ok': True})
+        return jsonify({'ok': True, 'restored': restored_counts})
     except Exception as e:
         conn.rollback()
         return jsonify({'error': f'復元に失敗しました: {e}'}), 500
@@ -1941,6 +2584,16 @@ def wipe_all():
 def health():
     return jsonify({'status': 'ok', 'version': '1.0.0'})
 
+# ── App version (TestFlight latest) ───────────────────────────
+@app.route('/api/app-version')
+def app_version():
+    return jsonify({
+        'latest_build': int(os.environ.get('APP_LATEST_BUILD', '26')),
+        'min_build': int(os.environ.get('APP_MIN_BUILD', '16')),
+        'message': os.environ.get('APP_UPDATE_MESSAGE', 'TestFlight で更新できます'),
+        'testflight_url': 'itms-beta://',
+    })
+
 # ── Legal pages ───────────────────────────────────────────────
 LEGAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'legal')
 
@@ -1956,6 +2609,10 @@ def _serve_legal(filename: str):
 @app.route('/privacy')
 def privacy():
     return _serve_legal('privacy.html')
+
+@app.route('/terms')
+def terms():
+    return _serve_legal('terms.html')
 
 @app.route('/support')
 def support():
