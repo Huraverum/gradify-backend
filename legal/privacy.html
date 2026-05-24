@@ -6,8 +6,9 @@
   <title>プライバシーポリシー | Gradify</title>
   <meta name="description" content="Gradify のプライバシーポリシー。学習・クイズ・画像解析アプリにおけるデータの取扱いについて。">
   <style>
-    :root { color-scheme: dark; }
+    :root { color-scheme: only dark; }
     *, *::before, *::after { box-sizing: border-box; }
+    html { background: #0b1220; }
     html, body { margin: 0; padding: 0; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Hiragino Sans', 'Noto Sans JP', sans-serif;
@@ -40,6 +41,12 @@
       background: #111827; border: 1px solid #1f2937; border-radius: 10px;
       padding: 14px 18px; margin: 16px 0; font-size: 14px;
     }
+    .alert {
+      background: rgba(127, 29, 29, 0.4); border: 1px solid #ef4444;
+      border-radius: 10px; padding: 14px 18px; margin: 16px 0;
+      color: #fecaca; font-size: 14px;
+    }
+    strong { color: #fde68a; }
     code {
       background: #1e293b; padding: 1px 6px; border-radius: 4px;
       color: #f8fafc; font-size: 13px;
@@ -116,10 +123,27 @@
     <li>不正利用の検出・防止</li>
   </ul>
 
-  <h2>6. 第三者提供</h2>
+  <h2>6. 第三者への提供</h2>
   <p>
-    法令に基づく開示要請を受けた場合を除き、取得したデータを第三者に提供することはありません。
-    ただし、前項4の外部AI APIへの送信は、機能提供のための業務委託にあたるものとします。
+    本アプリは、機能提供のため以下の事業者の API・インフラを利用します。
+    利用者が入力したテキストや画像は、AI採点・問題生成・ホスティングのため、当該事業者のサーバへ送信されます。
+  </p>
+  <ul>
+    <li>
+      <strong>Anthropic, PBC（米国）</strong>：AI採点・類題生成・ヒント生成・画像解析のためのテキスト/画像処理。<br>
+      <a href="https://www.anthropic.com/legal/privacy" target="_blank" rel="noopener">https://www.anthropic.com/legal/privacy</a>
+    </li>
+    <li>
+      <strong>Railway Corp.（米国）</strong>：バックエンドサーバーのホスティング。<br>
+      <a href="https://railway.app/legal/privacy" target="_blank" rel="noopener">https://railway.app/legal/privacy</a>
+    </li>
+  </ul>
+  <div class="alert">
+    入力された問題文・回答・画像は AI 処理のため海外サーバーに送信されます。<br>
+    実在する個人を特定できる情報や、機微情報（医療・金融・信条等）を含めないでください。
+  </div>
+  <p>
+    上記以外への第三者提供は、法令に基づく開示要請を受けた場合を除いて行いません。
   </p>
 
   <h2>7. データの削除・修正</h2>
