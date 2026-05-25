@@ -53,6 +53,7 @@ RATE_LIMITS = {
 }
 
 TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', 7))
+DAILY_AI_LIMIT = int(os.environ.get('DAILY_AI_LIMIT', 10))
 
 def _client_id():
     fwd = request.headers.get('X-Forwarded-For', '')
@@ -108,18 +109,25 @@ def _check_rate(bucket):
     return True, current + 1, limit
 
 def _check_trial(user_id):
-    """Returns dict with status: active|expired|subscribed, days_left, subscribed."""
+    """Returns dict with status: active|expired|subscribed, days_left, subscribed, buyout."""
     conn = get_db()
-    row = conn.execute('SELECT first_use_at, subscribed FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
+    row = conn.execute('SELECT first_use_at, subscribed, buyout FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
     if not row:
         first = datetime.now().isoformat(timespec='seconds')
-        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed) VALUES(?, ?, 0)', (user_id, first))
+        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, buyout) VALUES(?, ?, 0, 0)', (user_id, first))
         conn.commit()
         conn.close()
-        return {'status': 'active', 'days_left': TRIAL_DAYS, 'subscribed': False, 'first_use_at': first}
-    if row['subscribed']:
+        return {'status': 'active', 'days_left': TRIAL_DAYS, 'subscribed': False, 'buyout': False, 'first_use_at': first}
+    buyout = bool(row['buyout']) if 'buyout' in row.keys() else False
+    if row['subscribed'] or buyout:
         conn.close()
-        return {'status': 'subscribed', 'days_left': 0, 'subscribed': True, 'first_use_at': row['first_use_at']}
+        return {
+            'status': 'subscribed',
+            'days_left': 0,
+            'subscribed': bool(row['subscribed']),
+            'buyout': buyout,
+            'first_use_at': row['first_use_at'],
+        }
     try:
         first_dt = datetime.fromisoformat(row['first_use_at'])
     except Exception:
@@ -131,6 +139,7 @@ def _check_trial(user_id):
         'status': 'active' if days_left > 0 else 'expired',
         'days_left': days_left,
         'subscribed': False,
+        'buyout': False,
         'first_use_at': row['first_use_at'],
     }
 
@@ -142,10 +151,75 @@ def _trial_expired_response():
         'subscription_required': True,
     }), 402
 
+def _is_unlimited(user_id):
+    """Subscribed or buyout users have unlimited AI usage."""
+    info = _check_trial(user_id)
+    return info.get('subscribed') or info.get('buyout')
+
+def _daily_ai_used(user_id, day=None):
+    day = day or datetime.now().strftime('%Y-%m-%d')
+    conn = get_db()
+    row = conn.execute(
+        'SELECT count FROM user_daily_ai WHERE user_id=? AND day=?',
+        (user_id, day)
+    ).fetchone()
+    conn.close()
+    return row['count'] if row else 0
+
+def _check_daily_ai(user_id):
+    """Returns (ok, used, limit). Unlimited users always return (True, 0, 0)."""
+    if _is_unlimited(user_id):
+        return True, 0, 0
+    day = datetime.now().strftime('%Y-%m-%d')
+    used = _daily_ai_used(user_id, day)
+    if used >= DAILY_AI_LIMIT:
+        return False, used, DAILY_AI_LIMIT
+    return True, used, DAILY_AI_LIMIT
+
+def _consume_daily_ai(user_id):
+    """Increment daily AI counter. Skips for unlimited users."""
+    if _is_unlimited(user_id):
+        return
+    day = datetime.now().strftime('%Y-%m-%d')
+    conn = get_db()
+    conn.execute(
+        'INSERT INTO user_daily_ai (user_id, day, count) VALUES (?, ?, 1) '
+        'ON CONFLICT(user_id, day) DO UPDATE SET count = count + 1',
+        (user_id, day)
+    )
+    conn.commit()
+    conn.close()
+
+def _daily_limit_response(used, limit):
+    return jsonify({
+        'ok': False,
+        'error': '本日の無料枠を使い切りました',
+        'daily_limit': True,
+        'used': used,
+        'limit': limit,
+        'message': f'1日{limit}回までAI機能を無料で使えます。明日0時にリセットされます。',
+    }), 429
+
 @app.route('/api/trial-status')
 def trial_status():
     info = _check_trial(_user_id())
     return jsonify({**info, 'trial_days': TRIAL_DAYS})
+
+@app.route('/api/entitlement')
+def entitlement():
+    user_id = _user_id()
+    info = _check_trial(user_id)
+    unlimited = info.get('subscribed') or info.get('buyout')
+    day = datetime.now().strftime('%Y-%m-%d')
+    used = 0 if unlimited else _daily_ai_used(user_id, day)
+    return jsonify({
+        'subscribed': bool(info.get('subscribed')),
+        'buyout': bool(info.get('buyout')),
+        'unlimited': bool(unlimited),
+        'daily_used': used,
+        'daily_limit': DAILY_AI_LIMIT,
+        'daily_remaining': max(0, DAILY_AI_LIMIT - used) if not unlimited else None,
+    })
 
 def _rate_limit_response(bucket, current, limit):
     return jsonify({
@@ -318,7 +392,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS user_trial (
             user_id TEXT PRIMARY KEY,
             first_use_at TEXT NOT NULL,
-            subscribed INTEGER NOT NULL DEFAULT 0
+            subscribed INTEGER NOT NULL DEFAULT 0,
+            buyout INTEGER NOT NULL DEFAULT 0
+        )
+    ''')
+    trial_cols = [r['name'] for r in conn.execute('PRAGMA table_info(user_trial)').fetchall()]
+    if 'buyout' not in trial_cols:
+        conn.execute('ALTER TABLE user_trial ADD COLUMN buyout INTEGER NOT NULL DEFAULT 0')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_daily_ai (
+            user_id TEXT NOT NULL,
+            day TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (user_id, day)
         )
     ''')
     conn.execute('''
@@ -813,6 +899,9 @@ def score_sync():
     ok, current, limit = _check_rate('score')
     if not ok:
         return _rate_limit_response('score', current, limit)
+    ok_day, used, day_limit = _check_daily_ai(user_id)
+    if not ok_day:
+        return _daily_limit_response(used, day_limit)
 
     conn = get_db()
     row = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
@@ -823,6 +912,7 @@ def score_sync():
     kps = json.loads(row['key_points'] or '[]')
     kp_str = '\n'.join(f"- (w={k['w']}) {k['t']}" for k in kps)
 
+    _consume_daily_ai(user_id)
     client = anthropic.Anthropic(api_key=user_key)
     msg = client.messages.create(
         model='claude-sonnet-4-6',
@@ -1625,7 +1715,8 @@ def vision_quiz():
         user_key = ANTHROPIC_API_KEY
         if not user_key:
             return jsonify({'ok': False, 'error': 'api_key_missing', 'message': 'APIキーが未設定です'}), 401
-        trial = _check_trial(_user_id())
+        user_id = _user_id()
+        trial = _check_trial(user_id)
         if trial['status'] == 'expired':
             return _trial_expired_response()
         try:
@@ -1635,6 +1726,10 @@ def vision_quiz():
             ok, current, limit = True, 0, 0
         if not ok:
             return _rate_limit_response('vision_quiz', current, limit)
+        ok_day, used, day_limit = _check_daily_ai(user_id)
+        if not ok_day:
+            return _daily_limit_response(used, day_limit)
+        _consume_daily_ai(user_id)
 
         image_bytes = None
         mt = 'image/jpeg'
@@ -2083,10 +2178,16 @@ def get_mcq(q_id):
     if not ok:
         conn.close()
         return _rate_limit_response('ai', current, limit)
+    user_id = _user_id()
+    ok_day, used, day_limit = _check_daily_ai(user_id)
+    if not ok_day:
+        conn.close()
+        return _daily_limit_response(used, day_limit)
     import random
     kps = json.loads(row['key_points'] or '[]')
     answer_text = row['model_answer'] or '\n'.join(
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
+    _consume_daily_ai(user_id)
     client = anthropic.Anthropic(api_key=api_key)
     correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる' if requested_count == 2 else (
         '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
@@ -2420,6 +2521,7 @@ def restore():
 @app.route('/api/score-inline', methods=['POST'])
 def score_inline():
     d          = request.get_json(force=True)
+    user_id    = _user_id()
     question   = (d.get('question') or '').strip()
     model_ans  = (d.get('model_answer') or '').strip()
     key_points = d.get('key_points', [])
@@ -2433,7 +2535,11 @@ def score_inline():
     ok, current, limit = _check_rate('score')
     if not ok:
         return _rate_limit_response('score', current, limit)
+    ok_day, used, day_limit = _check_daily_ai(user_id)
+    if not ok_day:
+        return _daily_limit_response(used, day_limit)
     kp_str = '\n'.join(f"- (w=2) {k['t']}" for k in key_points if isinstance(k, dict) and k.get('t'))
+    _consume_daily_ai(user_id)
     client = anthropic.Anthropic(api_key=user_key)
     msg = client.messages.create(
         model='claude-sonnet-4-6', max_tokens=2000, temperature=0,
@@ -2577,6 +2683,51 @@ def wipe_all():
     conn.commit()
     conn.close()
     return jsonify({'status': 'ok', 'deleted': counts})
+
+# ── RevenueCat webhook ───────────────────────────────────────
+REVENUECAT_WEBHOOK_TOKEN = os.environ.get('REVENUECAT_WEBHOOK_TOKEN', '')
+BUYOUT_PRODUCT_ID = os.environ.get('RC_BUYOUT_PRODUCT_ID', 'gradify_buyout_1200')
+SUB_PRODUCT_ID = os.environ.get('RC_SUB_PRODUCT_ID', 'gradify_sub_300_monthly')
+
+@app.route('/api/revenuecat-webhook', methods=['POST'])
+def revenuecat_webhook():
+    if REVENUECAT_WEBHOOK_TOKEN:
+        auth = request.headers.get('Authorization', '')
+        token = auth.removeprefix('Bearer ').strip() if auth.startswith('Bearer ') else auth.strip()
+        if token != REVENUECAT_WEBHOOK_TOKEN:
+            return jsonify({'error': 'unauthorized'}), 401
+    payload = request.get_json(silent=True) or {}
+    event = payload.get('event') or {}
+    event_type = event.get('type', '')
+    app_user_id = event.get('app_user_id') or event.get('original_app_user_id') or ''
+    product_id = event.get('product_id') or ''
+    if not app_user_id:
+        return jsonify({'ok': True, 'skipped': 'no app_user_id'})
+    user_id = re.sub(r'[^A-Za-z0-9_.:-]', '', str(app_user_id))[:80] or LEGACY_USER_ID
+
+    is_buyout = product_id == BUYOUT_PRODUCT_ID
+    is_sub = product_id == SUB_PRODUCT_ID
+    activate_events = {'INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION', 'NON_RENEWING_PURCHASE', 'PRODUCT_CHANGE'}
+    deactivate_events = {'CANCELLATION', 'EXPIRATION', 'BILLING_ISSUE', 'SUBSCRIPTION_PAUSED'}
+
+    conn = get_db()
+    row = conn.execute('SELECT first_use_at FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
+    if not row:
+        first = datetime.now().isoformat(timespec='seconds')
+        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, buyout) VALUES(?, ?, 0, 0)', (user_id, first))
+
+    if event_type in activate_events:
+        if is_buyout:
+            conn.execute('UPDATE user_trial SET buyout=1 WHERE user_id=?', (user_id,))
+        elif is_sub:
+            conn.execute('UPDATE user_trial SET subscribed=1 WHERE user_id=?', (user_id,))
+    elif event_type in deactivate_events:
+        if is_sub:
+            conn.execute('UPDATE user_trial SET subscribed=0 WHERE user_id=?', (user_id,))
+        # buyout is permanent - never deactivate via webhook
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'event_type': event_type, 'user_id': user_id})
 
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
