@@ -1143,7 +1143,7 @@ def _record_attempt_graph(conn, *, qid, attempt_id, question_row, result, answer
         if not concept:
             continue
         _save_kg_edge(conn, user_id=user_id, type_='relates_to', source=q_node, target=concept)
-        if label in (result.get('missed') or []) or label in (result.get('partial') or []):
+        if label in (result.get('missed') or []):
             _save_kg_edge(conn, user_id=user_id, type_='confused_with', source=answer_node, target=concept)
         else:
             _save_kg_edge(conn, user_id=user_id, type_='explains', source=answer_node, target=concept)
