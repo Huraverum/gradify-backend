@@ -724,8 +724,16 @@ def get_questions(deck_id):
     difficulty = (request.args.get('difficulty') or '').strip()
     cat_clause  = ' AND q.category=?' if category else ''
     cat_params  = [category]              if category else []
-    diff_clause = ' AND q.difficulty=?' if difficulty else ''
-    diff_params = [difficulty]            if difficulty else []
+    # normal を指定された場合は difficulty 未設定（NULL）の既存問題もマッチさせる
+    if difficulty == 'normal':
+        diff_clause = ' AND (q.difficulty=? OR q.difficulty IS NULL)'
+        diff_params = [difficulty]
+    elif difficulty:
+        diff_clause = ' AND q.difficulty=?'
+        diff_params = [difficulty]
+    else:
+        diff_clause = ''
+        diff_params = []
 
     if mode == 'weak':
         # Attempted questions, lowest avg score first
@@ -746,7 +754,12 @@ def get_questions(deck_id):
             import random; random.shuffle(rows := list(rows))
     else:
         cat_sql = ' AND category=?' if category else ''
-        diff_sql = ' AND difficulty=?' if difficulty else ''
+        if difficulty == 'normal':
+            diff_sql = ' AND (difficulty=? OR difficulty IS NULL)'
+        elif difficulty:
+            diff_sql = ' AND difficulty=?'
+        else:
+            diff_sql = ''
         order   = ' ORDER BY RANDOM()' if shuffle else ' ORDER BY id ASC'
         sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{diff_sql}{order}'
         rows = conn.execute(sql, [deck_id] + cat_params + diff_params).fetchall()
