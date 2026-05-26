@@ -692,6 +692,8 @@ def delete_deck(deck_id):
 
 @app.route('/api/decks/claim-public', methods=['POST'])
 def claim_public_decks():
+    denied = _require_admin()
+    if denied: return denied
     user_id = _user_id()
     conn = get_db()
     nd = conn.execute('UPDATE decks SET owner_id=? WHERE owner_id IS NULL', (user_id,)).rowcount
@@ -1809,6 +1811,7 @@ def vision_quiz():
 
 @app.route('/api/vision-quiz/correction', methods=['POST'])
 def save_vision_quiz_correction():
+    user_id = _user_id()
     d = request.get_json(force=True)
     image_id = (d.get('imageId') or '').strip()
     ai_prediction = d.get('aiPrediction') or {}
@@ -2090,9 +2093,10 @@ def murmur_fragments():
 @app.route('/api/achievements/unlock', methods=['POST'])
 def unlock_achievements():
     d = request.get_json(force=True)
-    user_token = d.get('user_token', '')
+    # クライアントが他人の token を送ってきても無視し、認証済 user_id を採用する
+    user_token = _user_id()
     ids = d.get('achievement_ids', [])
-    if not user_token or not ids:
+    if not ids:
         return jsonify({'ok': False}), 400
     conn = get_db()
     for aid in ids:
@@ -2122,11 +2126,14 @@ def achievement_rarity():
 
 @app.route('/api/questions/<int:q_id>/hint')
 def get_hint(q_id):
+    user_id = _user_id()
     conn = get_db()
-    row = conn.execute('SELECT key_points, flowchart, category FROM questions WHERE id=?', (q_id,)).fetchone()
+    row = conn.execute('SELECT key_points, flowchart, category, owner_id FROM questions WHERE id=?', (q_id,)).fetchone()
     conn.close()
     if not row:
         return jsonify({'error': 'not found'}), 404
+    if row['owner_id'] and row['owner_id'] != user_id:
+        return jsonify({'error': 'forbidden'}), 403
     kps = json.loads(row['key_points'] or '[]')
     hints = [k['t'] for k in kps if isinstance(k, dict) and k.get('t')]
     return jsonify({
@@ -2403,6 +2410,7 @@ COMPANION_SYSTEM_SHISHIN = {
 
 @app.route('/api/companion/react', methods=['POST'])
 def companion_react():
+    user_id = _user_id()  # rate limit を user 単位で確実に効かせる
     d = request.get_json(force=True)
     player_input = (d.get('player_input') or '').strip()
     companion = (d.get('companion') or '').strip().lower()
@@ -2742,6 +2750,7 @@ def generate_questions_by_difficulty(deck_id):
 
 @app.route('/api/questions/<int:qid>/similar', methods=['POST'])
 def similar_question(qid):
+    user_id = _user_id()
     data    = request.get_json(force=True)
     api_key = ANTHROPIC_API_KEY
     conn    = get_db()
@@ -2749,6 +2758,8 @@ def similar_question(qid):
     conn.close()
     if not row:
         return jsonify({'error': '問題が見つかりません'}), 404
+    if row['owner_id'] and row['owner_id'] != user_id:
+        return jsonify({'error': 'forbidden'}), 403
     if not api_key:
         return jsonify({'error': 'APIキーが未設定です'}), 401
     ok, current, limit = _check_rate('ai')
