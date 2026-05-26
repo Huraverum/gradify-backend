@@ -2634,6 +2634,105 @@ def mistake_cards():
     return jsonify(cards)
 
 # ── Similar question ──────────────────────────────────────────
+DIFFICULTY_GUIDES = {
+    'easy':   '一問一答。用語・定義・基本事実を問い、主要語句が答えられればOK。model_answerは80字以内、key_pointsは2-3個。',
+    'normal': '症例や状況を提示し、診断・治療判断や複数観点の組み合わせを問う。model_answerは150字以内、key_pointsは3-4個。',
+    'hard':   'ガイドライン引用・複数選択肢比較・推論プロセスを要求する。「3つ挙げて根拠を述べよ」のような構成。model_answerは200字以内、key_pointsは5個以上。',
+}
+
+@app.route('/api/decks/<int:deck_id>/questions/generate', methods=['POST'])
+def generate_questions_by_difficulty(deck_id):
+    user_id = _user_id()
+    api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'APIキーが未設定です'}), 401
+    d = request.get_json(force=True) or {}
+    category = (d.get('category') or '').strip()
+    difficulty = (d.get('difficulty') or 'normal').strip()
+    if difficulty not in DIFFICULTY_GUIDES:
+        return jsonify({'error': f'未対応の難易度: {difficulty}'}), 400
+    try:
+        count = int(d.get('count') or 1)
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(count, 5))
+
+    conn = get_db()
+    deck = conn.execute('SELECT * FROM decks WHERE id=?', (deck_id,)).fetchone()
+    if not deck:
+        conn.close()
+        return jsonify({'error': 'deck not found'}), 404
+    if deck['owner_id'] and deck['owner_id'] != user_id:
+        conn.close()
+        return jsonify({'error': 'forbidden'}), 403
+
+    cat_sql = ' AND category=?' if category else ''
+    cat_params = [category] if category else []
+    existing_rows = conn.execute(
+        f'SELECT question FROM questions WHERE deck_id=? {cat_sql} ORDER BY id DESC LIMIT 30',
+        [deck_id] + cat_params,
+    ).fetchall()
+    existing_block = '\n'.join(f'- {r["question"][:80]}' for r in existing_rows[:20]) or '（既存問題なし）'
+
+    ok, current, limit_v = _check_rate('ai')
+    if not ok:
+        conn.close()
+        return _rate_limit_response('ai', current, limit_v)
+
+    deck_name = deck['name']
+    cat_hint = f'「{deck_name}」デッキの「{category}」分野' if category else f'「{deck_name}」デッキ全体のテーマ'
+    guide = DIFFICULTY_GUIDES[difficulty]
+    cat_for_json = category or deck_name
+    prompt = (
+        f'{cat_hint}に関する記述式問題を {count} 問、難易度「{difficulty}」で作成してください。\n\n'
+        f'難易度「{difficulty}」の特徴:\n{guide}\n\n'
+        f'既存問題（被らないように、テーマや切り口を変える）:\n{existing_block}\n\n'
+        '要件:\n'
+        '- 記述式（選択肢なし）\n'
+        '- model_answer は適切な字数で簡潔に\n'
+        '- 各問題の key_points は difficulty に合わせた個数\n'
+        '- 既存問題と同じテーマは避ける\n\n'
+        '必ずこのJSONのみを返してください（前後にテキスト不要）:\n'
+        f'{{"questions":[{{"question":"問題文","model_answer":"模範解答","key_points":[{{"t":"要点1"}},{{"t":"要点2"}}],"category":"{cat_for_json}"}}]}}'
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=2400,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        m = re.search(r'\{.*\}', raw, re.S)
+        if not m:
+            raise ValueError('JSON not found in response')
+        parsed = json.loads(m.group())
+        new_qs = parsed.get('questions') or []
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': f'生成に失敗しました: {e}'}), 502
+
+    now = datetime.now().strftime('%Y-%m-%d %H:%M')
+    owner = deck['owner_id'] or user_id
+    inserted_ids = []
+    for q in new_qs[:count]:
+        text = (q.get('question') or '').strip()
+        if not text:
+            continue
+        kps = q.get('key_points') or []
+        cat_val = (q.get('category') or category or deck_name).strip()
+        cur = conn.execute(
+            'INSERT INTO questions(deck_id,category,question,model_answer,key_points,owner_id,difficulty,created_at) VALUES(?,?,?,?,?,?,?,?)',
+            (deck_id, cat_val, text, (q.get('model_answer') or '')[:600],
+             json.dumps(kps, ensure_ascii=False),
+             owner, difficulty, now),
+        )
+        inserted_ids.append(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'ids': inserted_ids, 'count': len(inserted_ids), 'difficulty': difficulty})
+
 @app.route('/api/questions/<int:qid>/similar', methods=['POST'])
 def similar_question(qid):
     data    = request.get_json(force=True)
