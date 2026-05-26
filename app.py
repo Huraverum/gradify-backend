@@ -724,8 +724,8 @@ def get_questions(deck_id):
     difficulty = (request.args.get('difficulty') or '').strip()
     cat_clause  = ' AND q.category=?' if category else ''
     cat_params  = [category]              if category else []
-    # normal を指定された場合は difficulty 未設定（NULL）の既存問題もマッチさせる
-    if difficulty == 'normal':
+    # 標準 を指定された場合は difficulty 未設定（NULL）の既存問題もマッチさせる
+    if difficulty == '標準':
         diff_clause = ' AND (q.difficulty=? OR q.difficulty IS NULL)'
         diff_params = [difficulty]
     elif difficulty:
@@ -754,7 +754,7 @@ def get_questions(deck_id):
             import random; random.shuffle(rows := list(rows))
     else:
         cat_sql = ' AND category=?' if category else ''
-        if difficulty == 'normal':
+        if difficulty == '標準':
             diff_sql = ' AND (difficulty=? OR difficulty IS NULL)'
         elif difficulty:
             diff_sql = ' AND difficulty=?'
@@ -2635,9 +2635,10 @@ def mistake_cards():
 
 # ── Similar question ──────────────────────────────────────────
 DIFFICULTY_GUIDES = {
-    'easy':   '一問一答。用語・定義・基本事実を問い、主要語句が答えられればOK。model_answerは80字以内、key_pointsは2-3個。',
-    'normal': '症例や状況を提示し、診断・治療判断や複数観点の組み合わせを問う。model_answerは150字以内、key_pointsは3-4個。',
-    'hard':   'ガイドライン引用・複数選択肢比較・推論プロセスを要求する。「3つ挙げて根拠を述べよ」のような構成。model_answerは200字以内、key_pointsは5個以上。',
+    '基礎': '一問一答。用語・定義・基本事実を問い、主要語句が答えられればOK。model_answerは80字以内、key_pointsは2-3個。',
+    '標準': '症例や状況を提示し、診断・治療判断や複数観点の組み合わせを問う。model_answerは150字以内、key_pointsは3-4個。',
+    '応用': '複数の症例条件・例外パターン・最近のエビデンスを組み合わせて判断させる。model_answerは180字以内、key_pointsは4-5個。',
+    '発展': 'ガイドライン引用・複数選択肢比較・推論プロセスを要求する。「3つ挙げて根拠を述べよ」のような構成。model_answerは220字以内、key_pointsは5個以上。',
 }
 
 @app.route('/api/decks/<int:deck_id>/questions/generate', methods=['POST'])
