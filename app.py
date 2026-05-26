@@ -660,8 +660,6 @@ def get_decks():
 
 @app.route('/api/decks', methods=['POST'])
 def create_deck():
-    denied = _require_admin()
-    if denied: return denied
     d = request.get_json(force=True)
     name = (d.get('name') or '').strip()
     if not name:
@@ -677,8 +675,6 @@ def create_deck():
 
 @app.route('/api/decks/<int:deck_id>', methods=['DELETE'])
 def delete_deck(deck_id):
-    denied = _require_admin()
-    if denied: return denied
     user_id = _user_id()
     conn = get_db()
     deck = conn.execute('SELECT owner_id FROM decks WHERE id=?', (deck_id,)).fetchone()
@@ -776,8 +772,6 @@ def get_questions(deck_id):
 
 @app.route('/api/decks/<int:deck_id>/questions', methods=['POST'])
 def add_question(deck_id):
-    denied = _require_admin()
-    if denied: return denied
     user_id = _user_id()
     d = request.get_json(force=True)
     question = (d.get('question') or '').strip()
@@ -819,13 +813,19 @@ def get_categories(deck_id):
 
 @app.route('/api/questions/<int:q_id>', methods=['PUT'])
 def update_question(q_id):
-    denied = _require_admin()
-    if denied: return denied
+    user_id = _user_id()
     d = request.get_json(force=True)
     question = (d.get('question') or '').strip()
     if not question:
         return jsonify({'error': '問題文は必須です'}), 400
     conn = get_db()
+    row = conn.execute('SELECT owner_id FROM questions WHERE id=?', (q_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'question not found'}), 404
+    if row['owner_id'] and row['owner_id'] != user_id:
+        conn.close()
+        return jsonify({'error': 'forbidden'}), 403
     difficulty = (d.get('difficulty') or '').strip() or None
     conn.execute(
         'UPDATE questions SET category=?,question=?,model_answer=?,key_points=?,guideline_ref=?,flowchart=?,difficulty=? WHERE id=?',
@@ -840,9 +840,15 @@ def update_question(q_id):
 
 @app.route('/api/questions/<int:q_id>', methods=['DELETE'])
 def delete_question(q_id):
-    denied = _require_admin()
-    if denied: return denied
+    user_id = _user_id()
     conn = get_db()
+    row = conn.execute('SELECT owner_id FROM questions WHERE id=?', (q_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'question not found'}), 404
+    if row['owner_id'] and row['owner_id'] != user_id:
+        conn.close()
+        return jsonify({'error': 'forbidden'}), 403
     conn.execute('DELETE FROM questions WHERE id=?', (q_id,))
     conn.commit()
     conn.close()
