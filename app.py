@@ -186,36 +186,110 @@ def _daily_ai_used(user_id, day=None):
     return row['count'] if row else 0
 
 def _check_daily_ai(user_id):
-    """Returns (ok, used, limit). limit=0 のとき無制限。"""
+    """Returns (ok, used, limit). limit=0 のとき無制限。
+    daily 上限到達でも gem 残あれば True (gem fallback)。"""
     limit = _daily_limit_for(user_id)
     if limit == 0:
         return True, 0, 0
     day = datetime.now().strftime('%Y-%m-%d')
     used = _daily_ai_used(user_id, day)
-    if used >= limit:
-        return False, used, limit
-    return True, used, limit
+    if used < limit:
+        return True, used, limit
+    # daily 上限到達 → gem で代替
+    if _get_gem_balance(user_id) >= 1:
+        return True, used, limit
+    return False, used, limit
 
-def _consume_daily_ai(user_id):
-    """Increment daily AI counter. Skips for unlimited users."""
-    if _daily_limit_for(user_id) == 0:
-        return
-    day = datetime.now().strftime('%Y-%m-%d')
+def _get_gem_balance(user_id):
     conn = get_db()
+    row = conn.execute('SELECT balance FROM user_gem_wallet WHERE user_id=?', (user_id,)).fetchone()
+    conn.close()
+    return row['balance'] if row else 0
+
+def _consume_gem(user_id, amount=1):
+    conn = get_db()
+    row = conn.execute('SELECT balance FROM user_gem_wallet WHERE user_id=?', (user_id,)).fetchone()
+    cur = row['balance'] if row else 0
+    if cur < amount:
+        conn.close()
+        return False, cur
+    new_balance = cur - amount
+    now = datetime.now().isoformat(timespec='seconds')
     conn.execute(
-        'INSERT INTO user_daily_ai (user_id, day, count) VALUES (?, ?, 1) '
-        'ON CONFLICT(user_id, day) DO UPDATE SET count = count + 1',
-        (user_id, day)
+        'INSERT INTO user_gem_wallet(user_id, balance, updated_at) VALUES(?, ?, ?) '
+        'ON CONFLICT(user_id) DO UPDATE SET balance=?, updated_at=?',
+        (user_id, new_balance, now, new_balance, now),
     )
     conn.commit()
     conn.close()
+    return True, new_balance
+
+def _grant_gems(user_id, amount):
+    if amount <= 0:
+        return _get_gem_balance(user_id)
+    conn = get_db()
+    row = conn.execute('SELECT balance FROM user_gem_wallet WHERE user_id=?', (user_id,)).fetchone()
+    cur = row['balance'] if row else 0
+    new_balance = cur + amount
+    now = datetime.now().isoformat(timespec='seconds')
+    conn.execute(
+        'INSERT INTO user_gem_wallet(user_id, balance, updated_at) VALUES(?, ?, ?) '
+        'ON CONFLICT(user_id) DO UPDATE SET balance=?, updated_at=?',
+        (user_id, new_balance, now, new_balance, now),
+    )
+    conn.commit()
+    conn.close()
+    return new_balance
+
+def _check_or_use_credits(user_id):
+    """daily_ai が残ってればそれを返し、消費は別途。
+    なければ gem 残を確認。Returns (ok, kind, daily_used, daily_limit, gem_balance)
+    kind in ('daily', 'gem', None)"""
+    limit = _daily_limit_for(user_id)
+    day = datetime.now().strftime('%Y-%m-%d')
+    used = _daily_ai_used(user_id, day)
+    if limit == 0 or used < limit:
+        return True, 'daily', used, limit, _get_gem_balance(user_id)
+    gems = _get_gem_balance(user_id)
+    if gems >= 1:
+        return True, 'gem', used, limit, gems
+    return False, None, used, limit, gems
+
+def _consume_credit(user_id, kind):
+    if kind == 'daily':
+        _consume_daily_ai(user_id)
+    elif kind == 'gem':
+        _consume_gem(user_id, 1)
+
+def _consume_daily_ai(user_id):
+    """daily が残ってれば消費。なければ gem を1消費。両方無ければ no-op
+    (事前 _check_daily_ai で弾く想定)。"""
+    limit = _daily_limit_for(user_id)
+    if limit == 0:
+        return
+    day = datetime.now().strftime('%Y-%m-%d')
+    used = _daily_ai_used(user_id, day)
+    if used < limit:
+        conn = get_db()
+        conn.execute(
+            'INSERT INTO user_daily_ai (user_id, day, count) VALUES (?, ?, 1) '
+            'ON CONFLICT(user_id, day) DO UPDATE SET count = count + 1',
+            (user_id, day)
+        )
+        conn.commit()
+        conn.close()
+    else:
+        _consume_gem(user_id, 1)
 
 def _daily_limit_response(used, limit):
+    user_id = _user_id()
+    gem_balance = _get_gem_balance(user_id)
     return jsonify({
         'ok': False,
-        'error': '本日の無料枠を使い切りました',
+        'error': '本日の無料枠とダイヤを使い切りました' if gem_balance == 0 else '本日の無料枠を使い切りました',
         'daily_limit': True,
         'used': used,
+        'gem_balance': gem_balance,
         'limit': limit,
         'message': f'1日{limit}回までAI機能を無料で使えます。明日0時にリセットされます。',
     }), 429
@@ -232,6 +306,7 @@ def entitlement():
     limit = _daily_limit_for(user_id)
     day = datetime.now().strftime('%Y-%m-%d')
     used = _daily_ai_used(user_id, day)
+    gems = _get_gem_balance(user_id)
     return jsonify({
         'subscribed': bool(info.get('subscribed')),
         'tier': info.get('tier'),
@@ -241,7 +316,13 @@ def entitlement():
         'daily_used': used,
         'daily_limit': limit,
         'daily_remaining': max(0, limit - used),
+        'gem_balance': gems,
     })
+
+@app.route('/api/gems')
+def get_gems():
+    user_id = _user_id()
+    return jsonify({'balance': _get_gem_balance(user_id)})
 
 def _rate_limit_response(bucket, current, limit):
     return jsonify({
@@ -425,6 +506,13 @@ def init_db():
         conn.execute('ALTER TABLE user_trial ADD COLUMN buyout INTEGER NOT NULL DEFAULT 0')
     if 'subscribed_tier' not in trial_cols:
         conn.execute('ALTER TABLE user_trial ADD COLUMN subscribed_tier TEXT')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_gem_wallet (
+            user_id TEXT PRIMARY KEY,
+            balance INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
+        )
+    ''')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS user_daily_ai (
             user_id TEXT NOT NULL,
@@ -3096,11 +3184,22 @@ SUB_LIGHT_PRODUCT_ID    = os.environ.get('RC_SUB_LIGHT_PRODUCT_ID',    'gradify_
 SUB_STANDARD_PRODUCT_ID = os.environ.get('RC_SUB_STANDARD_PRODUCT_ID', 'gradify_sub_standard')
 SUB_PRO_PRODUCT_ID      = os.environ.get('RC_SUB_PRO_PRODUCT_ID',      'gradify_sub_pro')
 
+# Consumable IAP: ダイヤパック商品ID → 付与ダイヤ数
+GEM_PRODUCTS = {
+    os.environ.get('RC_GEMS_TRIAL_PRODUCT_ID',      'gradify_gems_trial'):      100,
+    os.environ.get('RC_GEMS_STANDARD_PRODUCT_ID',   'gradify_gems_standard'):   450,
+    os.environ.get('RC_GEMS_VALUE_PRODUCT_ID',      'gradify_gems_value'):      1200,
+    os.environ.get('RC_GEMS_BULK_PRODUCT_ID',       'gradify_gems_bulk'):       2500,
+}
+
 def _tier_for_product(product_id):
     if product_id == SUB_LIGHT_PRODUCT_ID:    return 'light'
     if product_id == SUB_STANDARD_PRODUCT_ID: return 'standard'
     if product_id == SUB_PRO_PRODUCT_ID:      return 'pro'
     return None
+
+def _gems_for_product(product_id):
+    return GEM_PRODUCTS.get(product_id, 0)
 
 @app.route('/api/revenuecat-webhook', methods=['POST'])
 def revenuecat_webhook():
@@ -3119,6 +3218,7 @@ def revenuecat_webhook():
     user_id = re.sub(r'[^A-Za-z0-9_.:-]', '', str(app_user_id))[:80] or LEGACY_USER_ID
 
     tier = _tier_for_product(product_id)
+    gems_to_grant = _gems_for_product(product_id)
     activate_events = {'INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION', 'NON_RENEWING_PURCHASE', 'PRODUCT_CHANGE'}
     deactivate_events = {'CANCELLATION', 'EXPIRATION', 'BILLING_ISSUE', 'SUBSCRIPTION_PAUSED'}
 
@@ -3134,7 +3234,14 @@ def revenuecat_webhook():
         conn.execute('UPDATE user_trial SET subscribed=0, subscribed_tier=NULL WHERE user_id=?', (user_id,))
     conn.commit()
     conn.close()
-    return jsonify({'ok': True, 'event_type': event_type, 'user_id': user_id, 'tier': tier})
+    # Consumable IAP (ダイヤパック): NON_RENEWING_PURCHASE で gem 付与
+    gem_balance_after = None
+    if event_type in activate_events and gems_to_grant > 0:
+        gem_balance_after = _grant_gems(user_id, gems_to_grant)
+    return jsonify({
+        'ok': True, 'event_type': event_type, 'user_id': user_id,
+        'tier': tier, 'gems_granted': gems_to_grant, 'gem_balance': gem_balance_after,
+    })
 
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
