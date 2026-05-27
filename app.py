@@ -53,7 +53,12 @@ RATE_LIMITS = {
 }
 
 TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', 7))
-DAILY_AI_LIMIT = int(os.environ.get('DAILY_AI_LIMIT', 10))
+DAILY_AI_LIMIT = int(os.environ.get('DAILY_AI_LIMIT', 5))
+# サブスクのティア別 1日上限 (AI採点・MCQ生成・写真クイズ等のAIコール数)
+# シンプル採点モードはこの枠を消費しない
+SUB_LIGHT_DAILY_LIMIT    = int(os.environ.get('SUB_LIGHT_DAILY_LIMIT', 7))
+SUB_STANDARD_DAILY_LIMIT = int(os.environ.get('SUB_STANDARD_DAILY_LIMIT', 15))
+SUB_PRO_DAILY_LIMIT      = int(os.environ.get('SUB_PRO_DAILY_LIMIT', 33))
 
 def _client_id():
     fwd = request.headers.get('X-Forwarded-For', '')
@@ -109,23 +114,23 @@ def _check_rate(bucket):
     return True, current + 1, limit
 
 def _check_trial(user_id):
-    """Returns dict with status: active|expired|subscribed, days_left, subscribed, buyout."""
+    """Returns dict with status: active|expired|subscribed, days_left, subscribed, tier, first_use_at."""
     conn = get_db()
-    row = conn.execute('SELECT first_use_at, subscribed, buyout FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
+    row = conn.execute('SELECT first_use_at, subscribed, subscribed_tier FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
     if not row:
         first = datetime.now().isoformat(timespec='seconds')
-        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, buyout) VALUES(?, ?, 0, 0)', (user_id, first))
+        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, subscribed_tier) VALUES(?, ?, 0, NULL)', (user_id, first))
         conn.commit()
         conn.close()
-        return {'status': 'active', 'days_left': TRIAL_DAYS, 'subscribed': False, 'buyout': False, 'first_use_at': first}
-    buyout = bool(row['buyout']) if 'buyout' in row.keys() else False
-    if row['subscribed'] or buyout:
+        return {'status': 'active', 'days_left': TRIAL_DAYS, 'subscribed': False, 'tier': None, 'first_use_at': first}
+    tier = row['subscribed_tier'] if 'subscribed_tier' in row.keys() else None
+    if row['subscribed']:
         conn.close()
         return {
             'status': 'subscribed',
             'days_left': 0,
-            'subscribed': bool(row['subscribed']),
-            'buyout': buyout,
+            'subscribed': True,
+            'tier': (tier or '').lower() or 'standard',
             'first_use_at': row['first_use_at'],
         }
     try:
@@ -139,7 +144,7 @@ def _check_trial(user_id):
         'status': 'active' if days_left > 0 else 'expired',
         'days_left': days_left,
         'subscribed': False,
-        'buyout': False,
+        'tier': None,
         'first_use_at': row['first_use_at'],
     }
 
@@ -151,10 +156,24 @@ def _trial_expired_response():
         'subscription_required': True,
     }), 402
 
-def _is_unlimited(user_id):
-    """Subscribed or buyout users have unlimited AI usage."""
+def _daily_limit_for(user_id):
+    """Returns the user's daily AI limit. tier別の上限を返す。
+    無料: DAILY_AI_LIMIT / light: SUB_LIGHT / standard: SUB_STANDARD / pro: SUB_PRO"""
     info = _check_trial(user_id)
-    return info.get('subscribed') or info.get('buyout')
+    if info.get('subscribed'):
+        tier = (info.get('tier') or 'standard').lower()
+        if tier == 'pro':
+            return SUB_PRO_DAILY_LIMIT
+        if tier == 'standard':
+            return SUB_STANDARD_DAILY_LIMIT
+        if tier == 'light':
+            return SUB_LIGHT_DAILY_LIMIT
+        return SUB_STANDARD_DAILY_LIMIT
+    return DAILY_AI_LIMIT
+
+def _is_unlimited(user_id):
+    """Backward-compat. ティア廃止により常に False。"""
+    return False
 
 def _daily_ai_used(user_id, day=None):
     day = day or datetime.now().strftime('%Y-%m-%d')
@@ -167,18 +186,19 @@ def _daily_ai_used(user_id, day=None):
     return row['count'] if row else 0
 
 def _check_daily_ai(user_id):
-    """Returns (ok, used, limit). Unlimited users always return (True, 0, 0)."""
-    if _is_unlimited(user_id):
+    """Returns (ok, used, limit). limit=0 のとき無制限。"""
+    limit = _daily_limit_for(user_id)
+    if limit == 0:
         return True, 0, 0
     day = datetime.now().strftime('%Y-%m-%d')
     used = _daily_ai_used(user_id, day)
-    if used >= DAILY_AI_LIMIT:
-        return False, used, DAILY_AI_LIMIT
-    return True, used, DAILY_AI_LIMIT
+    if used >= limit:
+        return False, used, limit
+    return True, used, limit
 
 def _consume_daily_ai(user_id):
     """Increment daily AI counter. Skips for unlimited users."""
-    if _is_unlimited(user_id):
+    if _daily_limit_for(user_id) == 0:
         return
     day = datetime.now().strftime('%Y-%m-%d')
     conn = get_db()
@@ -209,16 +229,18 @@ def trial_status():
 def entitlement():
     user_id = _user_id()
     info = _check_trial(user_id)
-    unlimited = info.get('subscribed') or info.get('buyout')
+    limit = _daily_limit_for(user_id)
     day = datetime.now().strftime('%Y-%m-%d')
-    used = 0 if unlimited else _daily_ai_used(user_id, day)
+    used = _daily_ai_used(user_id, day)
     return jsonify({
         'subscribed': bool(info.get('subscribed')),
-        'buyout': bool(info.get('buyout')),
-        'unlimited': bool(unlimited),
+        'tier': info.get('tier'),
+        # buyout は廃止。互換のため false を返し続ける
+        'buyout': False,
+        'unlimited': False,
         'daily_used': used,
-        'daily_limit': DAILY_AI_LIMIT,
-        'daily_remaining': max(0, DAILY_AI_LIMIT - used) if not unlimited else None,
+        'daily_limit': limit,
+        'daily_remaining': max(0, limit - used),
     })
 
 def _rate_limit_response(bucket, current, limit):
@@ -388,6 +410,8 @@ def init_db():
         conn.execute('ALTER TABLE questions ADD COLUMN owner_id TEXT DEFAULT NULL')
     if 'difficulty' not in cols:
         conn.execute('ALTER TABLE questions ADD COLUMN difficulty TEXT DEFAULT NULL')
+    if 'mcq_correct_count' not in cols:
+        conn.execute('ALTER TABLE questions ADD COLUMN mcq_correct_count INTEGER DEFAULT NULL')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS user_trial (
             user_id TEXT PRIMARY KEY,
@@ -399,6 +423,8 @@ def init_db():
     trial_cols = [r['name'] for r in conn.execute('PRAGMA table_info(user_trial)').fetchall()]
     if 'buyout' not in trial_cols:
         conn.execute('ALTER TABLE user_trial ADD COLUMN buyout INTEGER NOT NULL DEFAULT 0')
+    if 'subscribed_tier' not in trial_cols:
+        conn.execute('ALTER TABLE user_trial ADD COLUMN subscribed_tier TEXT')
     conn.execute('''
         CREATE TABLE IF NOT EXISTS user_daily_ai (
             user_id TEXT NOT NULL,
@@ -720,6 +746,7 @@ def get_questions(deck_id):
     mode     = request.args.get('mode', '')   # 'weak' | 'new' | ''
 
     difficulty = (request.args.get('difficulty') or '').strip()
+    mcq_cc_raw = (request.args.get('mcq_correct_count') or '').strip()
     cat_clause  = ' AND q.category=?' if category else ''
     cat_params  = [category]              if category else []
     # 標準 を指定された場合は difficulty 未設定（NULL）の既存問題もマッチさせる
@@ -732,22 +759,28 @@ def get_questions(deck_id):
     else:
         diff_clause = ''
         diff_params = []
+    if mcq_cc_raw in ('1', '2'):
+        mcq_clause = ' AND q.mcq_correct_count=?'
+        mcq_params = [int(mcq_cc_raw)]
+    else:
+        mcq_clause = ''
+        mcq_params = []
 
     if mode == 'weak':
         # Attempted questions, lowest avg score first
         sql  = f'''SELECT q.* FROM questions q
                    JOIN attempts a ON a.question_id = q.id
-                   WHERE q.deck_id=? AND a.user_id=? {cat_clause}{diff_clause}
+                   WHERE q.deck_id=? AND a.user_id=? {cat_clause}{diff_clause}{mcq_clause}
                    GROUP BY q.id
                    ORDER BY AVG(a.score) ASC'''
-        rows = conn.execute(sql, [deck_id, user_id] + cat_params + diff_params).fetchall()
+        rows = conn.execute(sql, [deck_id, user_id] + cat_params + diff_params + mcq_params).fetchall()
     elif mode == 'new':
         # Questions with zero attempts
         sql  = f'''SELECT q.* FROM questions q
                    WHERE q.deck_id=?
                    AND q.id NOT IN (SELECT DISTINCT question_id FROM attempts WHERE user_id=?)
-                   {cat_clause}{diff_clause}'''
-        rows = conn.execute(sql, [deck_id, user_id] + cat_params + diff_params).fetchall()
+                   {cat_clause}{diff_clause}{mcq_clause}'''
+        rows = conn.execute(sql, [deck_id, user_id] + cat_params + diff_params + mcq_params).fetchall()
         if shuffle:
             import random; random.shuffle(rows := list(rows))
     else:
@@ -758,9 +791,10 @@ def get_questions(deck_id):
             diff_sql = ' AND difficulty=?'
         else:
             diff_sql = ''
+        mcq_sql = ' AND mcq_correct_count=?' if mcq_cc_raw in ('1', '2') else ''
         order   = ' ORDER BY RANDOM()' if shuffle else ' ORDER BY id ASC'
-        sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{diff_sql}{order}'
-        rows = conn.execute(sql, [deck_id] + cat_params + diff_params).fetchall()
+        sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{diff_sql}{mcq_sql}{order}'
+        rows = conn.execute(sql, [deck_id] + cat_params + diff_params + mcq_params).fetchall()
 
     conn.close()
     result = []
@@ -790,8 +824,9 @@ def add_question(deck_id):
     owner = deck['owner_id'] or user_id
     mcq_options = d.get('mcq_options')  # pre-cached options from push script
     difficulty = (d.get('difficulty') or '').strip() or None
+    mcq_correct_count = _coerce_mcq_correct_count(d.get('mcq_correct_count'))
     cur = conn.execute(
-        'INSERT INTO questions(deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,mcq_options,owner_id,difficulty,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO questions(deck_id,category,question,model_answer,key_points,guideline_ref,flowchart,mcq_options,owner_id,difficulty,mcq_correct_count,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
         (deck_id, (d.get('category') or '').strip(), question,
          d.get('model_answer', ''),
          json.dumps(d.get('key_points', []), ensure_ascii=False),
@@ -799,6 +834,7 @@ def add_question(deck_id):
          json.dumps(mcq_options) if mcq_options else None,
          owner,
          difficulty,
+         mcq_correct_count,
          datetime.now().strftime('%Y-%m-%d %H:%M')))
     conn.commit()
     conn.close()
@@ -829,13 +865,14 @@ def update_question(q_id):
         conn.close()
         return jsonify({'error': 'forbidden'}), 403
     difficulty = (d.get('difficulty') or '').strip() or None
+    mcq_correct_count = _coerce_mcq_correct_count(d.get('mcq_correct_count'))
     conn.execute(
-        'UPDATE questions SET category=?,question=?,model_answer=?,key_points=?,guideline_ref=?,flowchart=?,difficulty=? WHERE id=?',
+        'UPDATE questions SET category=?,question=?,model_answer=?,key_points=?,guideline_ref=?,flowchart=?,difficulty=?,mcq_correct_count=? WHERE id=?',
         ((d.get('category') or '').strip(), question,
          d.get('model_answer', ''),
          json.dumps(d.get('key_points', []), ensure_ascii=False),
          d.get('guideline_ref', ''), d.get('flowchart', ''),
-         difficulty, q_id))
+         difficulty, mcq_correct_count, q_id))
     conn.commit()
     conn.close()
     return jsonify({'ok': True})
@@ -1420,6 +1457,37 @@ def get_results():
         'feedback': r['feedback'] or '',
         'advice':   r['advice']   or '',
     } for r in rows})
+
+@app.route('/api/attempts', methods=['POST'])
+def post_attempt_manual():
+    """シンプル採点モード用: AI不使用で attempt を記録する。daily_ai 消費なし。"""
+    user_id = _user_id()
+    d = request.get_json(force=True) or {}
+    question_id = int(d.get('question_id') or 0)
+    if not question_id:
+        return jsonify({'error': 'question_id required'}), 400
+    score = int(d.get('score') or 0)
+    grade = str(d.get('grade') or 'D')[:1]
+    answer = str(d.get('answer') or '')
+    feedback = str(d.get('feedback') or '')
+    covered = d.get('covered') or []
+    partial = d.get('partial') or []
+    missed  = d.get('missed')  or []
+    advice  = str(d.get('advice') or '')
+    conn = get_db()
+    qrow = conn.execute('SELECT model_answer FROM questions WHERE id=?', (question_id,)).fetchone()
+    if not qrow:
+        conn.close()
+        return jsonify({'error': 'question not found'}), 404
+    conn.execute(
+        'INSERT INTO attempts(question_id,score,grade,answer,model_answer,covered,partial,missed,feedback,advice,attempted_at,user_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+        (question_id, score, grade, answer, qrow['model_answer'] or '',
+         json.dumps(covered, ensure_ascii=False), json.dumps(partial, ensure_ascii=False), json.dumps(missed, ensure_ascii=False),
+         feedback, advice, datetime.now().isoformat(timespec='seconds'), user_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
 @app.route('/api/attempts')
 def get_attempts():
@@ -2144,6 +2212,15 @@ def get_hint(q_id):
     })
 
 # ── MCQ ──────────────────────────────────────────────────────
+def _coerce_mcq_correct_count(value):
+    if value is None or value == '':
+        return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n in (1, 2) else None
+
 def _normalize_mcq_payload(data):
     options = data.get('options') or []
     if len(options) != 5:
@@ -2188,6 +2265,11 @@ def get_mcq(q_id):
     if not row:
         conn.close()
         return jsonify({'error': 'not found'}), 404
+    # URLクエリ未指定なら問題ごとの mcq_correct_count を採用する
+    if requested_count is None:
+        per_question = _coerce_mcq_correct_count(row['mcq_correct_count'])
+        if per_question is not None:
+            requested_count = per_question
     if row['mcq_options']:
         try:
             cached = json.loads(row['mcq_options'])
@@ -2245,7 +2327,7 @@ def get_mcq(q_id):
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
         normalized = _normalize_mcq_payload(data)
         result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
-        conn.execute('UPDATE questions SET mcq_options=? WHERE id=?', (json.dumps(result), q_id))
+        conn.execute('UPDATE questions SET mcq_options=? WHERE id=?', (json.dumps(result, ensure_ascii=False), q_id))
         conn.commit()
     except Exception as e:
         conn.close()
@@ -2590,6 +2672,200 @@ def score_inline():
     result['coins_earned'] = 0
     return jsonify(result)
 
+# ── Phase 3 payload-mode endpoints ───────────────────────────
+# 端末ローカルDB移行後はサーバーが question_id を引けないので、
+# 必要なフィールド一式を payload で受け取って AI 呼び出しだけ行う。
+# DB への保存・引きは一切しない（薄いプロキシ）。
+
+@app.route('/api/mcq-inline', methods=['POST'])
+def mcq_inline():
+    """ペイロード版 MCQ 生成。DB lookup なし、キャッシュ保存なし。"""
+    api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'サーバー側のAPIキーが未設定です'}), 503
+    d = request.get_json(force=True) or {}
+    question_text = (d.get('question') or '').strip()
+    model_answer = (d.get('model_answer') or '').strip()
+    key_points = d.get('key_points') or []
+    correct_count_raw = d.get('correct_count', 'mixed')
+    requested_count = int(correct_count_raw) if correct_count_raw in (1, 2, '1', '2') else None
+    if not question_text:
+        return jsonify({'error': 'question required'}), 400
+    ok, current, limit = _check_rate('ai')
+    if not ok:
+        return _rate_limit_response('ai', current, limit)
+    user_id = _user_id()
+    ok_day, used, day_limit = _check_daily_ai(user_id)
+    if not ok_day:
+        return _daily_limit_response(used, day_limit)
+    answer_text = model_answer or '\n'.join(
+        f"・{k['t']}" for k in key_points if isinstance(k, dict) and k.get('t'))
+    _consume_daily_ai(user_id)
+    correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる' if requested_count == 2 else (
+        '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
+        '設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる'
+    )
+    prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
+
+問題: {question_text}
+
+正解の要点:
+{answer_text[:600]}
+
+要件:
+- 選択肢は5つ
+- {correct_rule}
+- correct_indices は「設問への答えとして選ぶべき選択肢」の番号にする
+- 問題文が「誤り」「適切でない」「最も適切でない」などを問う場合は、誤っている／適切でない選択肢を correct_indices に入れる
+- correct_indices に入れる選択肢は模範解答の核心を1〜2文で簡潔に反映する
+- correct_indices 以外の選択肢は、それぞれ異なる方向の非該当選択肢にする
+- 各選択肢は30〜60字程度
+
+必ずこのJSONのみを返してください（前後にテキスト不要）:
+{{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001', max_tokens=800,
+            messages=[{'role': 'user', 'content': prompt}])
+        raw = msg.content[0].text.strip()
+        data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+        normalized = _normalize_mcq_payload(data)
+        result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/score-mcq-inline', methods=['POST'])
+def score_mcq_inline():
+    """ペイロード版 MCQ 採点。DB lookup なし、attempts/wallet 保存なし。"""
+    d = request.get_json(force=True) or {}
+    correct = bool(d.get('correct'))
+    model_answer = (d.get('model_answer') or '').strip()
+    score = 100 if correct else 0
+    grade = 'S' if correct else 'D'
+    return jsonify({
+        'score': score, 'grade': grade,
+        'model_answer': model_answer,
+        'covered': [], 'partial': [], 'missed': [],
+        'feedback': '正解です！' if correct else '不正解。解説を確認しましょう。',
+        'advice': '',
+    })
+
+@app.route('/api/similar-inline', methods=['POST'])
+def similar_inline():
+    """ペイロード版 類題生成。DB lookup なし、DB 保存なし。"""
+    api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'APIキーが未設定です'}), 401
+    d = request.get_json(force=True) or {}
+    question_text = (d.get('question') or '').strip()
+    category = (d.get('category') or '').strip()
+    model_answer = (d.get('model_answer') or '').strip()
+    key_points = d.get('key_points') or []
+    if not question_text:
+        return jsonify({'error': 'question required'}), 400
+    ok, current, limit = _check_rate('ai')
+    if not ok:
+        return _rate_limit_response('ai', current, limit)
+    try:
+        kp_text = '\n'.join(f'・{k["t"]}' for k in key_points[:5] if isinstance(k, dict) and k.get('t'))
+    except Exception:
+        kp_text = model_answer[:300]
+    user_id = _user_id()
+    ok_day, used, day_limit = _check_daily_ai(user_id)
+    if not ok_day:
+        return _daily_limit_response(used, day_limit)
+    _consume_daily_ai(user_id)
+    client = anthropic.Anthropic(api_key=api_key)
+    prompt = f"""以下の記述式問題と類似した、同じ知識領域だが異なる切り口の問題を1つ作成してください。
+
+元の問題: {question_text}
+カテゴリ: {category}
+正解の要点:
+{kp_text}
+
+要件:
+- 同じ知識を問うが、問い方・状況設定・視点を変える
+- 記述式（選択肢なし）
+- 難易度は同程度
+- key_pointsは3〜5個
+
+必ずこのJSONのみを返してください（前後にテキスト不要）:
+{{"question":"問題文","model_answer":"模範解答（100字以内）","key_points":[{{"t":"要点1"}},{{"t":"要点2"}},{{"t":"要点3"}}],"category":"{category}"}}"""
+    msg = client.messages.create(
+        model='claude-haiku-4-5-20251001', max_tokens=600,
+        messages=[{'role': 'user', 'content': prompt}])
+    raw = msg.content[0].text.strip()
+    result = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+    return jsonify(result)
+
+@app.route('/api/generate-questions-inline', methods=['POST'])
+def generate_questions_inline():
+    """ペイロード版 難易度別問題生成。DB lookup/insert なし、生成結果を返すのみ。
+    クライアントが localAddQuestion で永続化する想定。"""
+    api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'APIキーが未設定です'}), 401
+    d = request.get_json(force=True) or {}
+    deck_name = (d.get('deck_name') or '').strip() or 'デッキ'
+    category = (d.get('category') or '').strip()
+    difficulty = (d.get('difficulty') or '標準').strip()
+    existing_questions = d.get('existing_questions') or []
+    if difficulty not in DIFFICULTY_GUIDES:
+        return jsonify({'error': f'未対応の難易度: {difficulty}'}), 400
+    try:
+        count = int(d.get('count') or 1)
+    except (TypeError, ValueError):
+        count = 1
+    count = max(1, min(count, 5))
+    ok, current, limit_v = _check_rate('ai')
+    if not ok:
+        return _rate_limit_response('ai', current, limit_v)
+    user_id = _user_id()
+    ok_day, used, day_limit = _check_daily_ai(user_id)
+    if not ok_day:
+        return _daily_limit_response(used, day_limit)
+    cat_hint = f'「{deck_name}」デッキの「{category}」分野' if category else f'「{deck_name}」デッキ全体のテーマ'
+    cat_for_json = category or deck_name
+    existing_block = '\n'.join(
+        f'- {str(q)[:80]}' for q in (existing_questions[:20] if isinstance(existing_questions, list) else [])
+    ) or '（既存問題なし）'
+    guide = DIFFICULTY_GUIDES[difficulty]
+    prompt = (
+        f'{cat_hint}に関する記述式問題を {count} 問、難易度「{difficulty}」で作成してください。\n\n'
+        f'難易度「{difficulty}」の特徴:\n{guide}\n\n'
+        f'既存問題（被らないように、テーマや切り口を変える）:\n{existing_block}\n\n'
+        '要件:\n'
+        '- 記述式（選択肢なし）\n'
+        '- model_answer は適切な字数で簡潔に\n'
+        '- 各問題の key_points は difficulty に合わせた個数\n'
+        '- 既存問題と同じテーマは避ける\n\n'
+        '必ずこのJSONのみを返してください（前後にテキスト不要）:\n'
+        f'{{"questions":[{{"question":"問題文","model_answer":"模範解答","key_points":[{{"t":"要点1"}},{{"t":"要点2"}}],"category":"{cat_for_json}"}}]}}'
+    )
+    _consume_daily_ai(user_id)
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=2400,
+            messages=[{'role': 'user', 'content': prompt}],
+        )
+        raw = msg.content[0].text.strip()
+        m = re.search(r'\{.*\}', raw, re.S)
+        if not m:
+            raise ValueError('JSON not found in response')
+        parsed = json.loads(m.group())
+        new_qs = (parsed.get('questions') or [])[:count]
+    except Exception as e:
+        return jsonify({'error': f'生成に失敗しました: {e}'}), 502
+    # 難易度フィールドを各問題に追加して返す
+    for q in new_qs:
+        q.setdefault('difficulty', difficulty)
+        q.setdefault('category', category or deck_name)
+    return jsonify({'ok': True, 'questions': new_qs, 'difficulty': difficulty, 'count': len(new_qs)})
+
 # ── Weakness radar ───────────────────────────────────────────
 @app.route('/api/weakness-radar')
 def weakness_radar():
@@ -2816,8 +3092,15 @@ def wipe_all():
 
 # ── RevenueCat webhook ───────────────────────────────────────
 REVENUECAT_WEBHOOK_TOKEN = os.environ.get('REVENUECAT_WEBHOOK_TOKEN', '')
-BUYOUT_PRODUCT_ID = os.environ.get('RC_BUYOUT_PRODUCT_ID', 'gradify_buyout_1200')
-SUB_PRODUCT_ID = os.environ.get('RC_SUB_PRODUCT_ID', 'gradify_sub_300_monthly')
+SUB_LIGHT_PRODUCT_ID    = os.environ.get('RC_SUB_LIGHT_PRODUCT_ID',    'gradify_sub_light')
+SUB_STANDARD_PRODUCT_ID = os.environ.get('RC_SUB_STANDARD_PRODUCT_ID', 'gradify_sub_standard')
+SUB_PRO_PRODUCT_ID      = os.environ.get('RC_SUB_PRO_PRODUCT_ID',      'gradify_sub_pro')
+
+def _tier_for_product(product_id):
+    if product_id == SUB_LIGHT_PRODUCT_ID:    return 'light'
+    if product_id == SUB_STANDARD_PRODUCT_ID: return 'standard'
+    if product_id == SUB_PRO_PRODUCT_ID:      return 'pro'
+    return None
 
 @app.route('/api/revenuecat-webhook', methods=['POST'])
 def revenuecat_webhook():
@@ -2835,8 +3118,7 @@ def revenuecat_webhook():
         return jsonify({'ok': True, 'skipped': 'no app_user_id'})
     user_id = re.sub(r'[^A-Za-z0-9_.:-]', '', str(app_user_id))[:80] or LEGACY_USER_ID
 
-    is_buyout = product_id == BUYOUT_PRODUCT_ID
-    is_sub = product_id == SUB_PRODUCT_ID
+    tier = _tier_for_product(product_id)
     activate_events = {'INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION', 'NON_RENEWING_PURCHASE', 'PRODUCT_CHANGE'}
     deactivate_events = {'CANCELLATION', 'EXPIRATION', 'BILLING_ISSUE', 'SUBSCRIPTION_PAUSED'}
 
@@ -2844,20 +3126,15 @@ def revenuecat_webhook():
     row = conn.execute('SELECT first_use_at FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
     if not row:
         first = datetime.now().isoformat(timespec='seconds')
-        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, buyout) VALUES(?, ?, 0, 0)', (user_id, first))
+        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, subscribed_tier) VALUES(?, ?, 0, NULL)', (user_id, first))
 
-    if event_type in activate_events:
-        if is_buyout:
-            conn.execute('UPDATE user_trial SET buyout=1 WHERE user_id=?', (user_id,))
-        elif is_sub:
-            conn.execute('UPDATE user_trial SET subscribed=1 WHERE user_id=?', (user_id,))
-    elif event_type in deactivate_events:
-        if is_sub:
-            conn.execute('UPDATE user_trial SET subscribed=0 WHERE user_id=?', (user_id,))
-        # buyout is permanent - never deactivate via webhook
+    if event_type in activate_events and tier is not None:
+        conn.execute('UPDATE user_trial SET subscribed=1, subscribed_tier=? WHERE user_id=?', (tier, user_id))
+    elif event_type in deactivate_events and tier is not None:
+        conn.execute('UPDATE user_trial SET subscribed=0, subscribed_tier=NULL WHERE user_id=?', (user_id,))
     conn.commit()
     conn.close()
-    return jsonify({'ok': True, 'event_type': event_type, 'user_id': user_id})
+    return jsonify({'ok': True, 'event_type': event_type, 'user_id': user_id, 'tier': tier})
 
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
