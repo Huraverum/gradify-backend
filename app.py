@@ -2398,6 +2398,11 @@ def get_mcq(q_id):
         '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
         '設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる'
     )
+    example_indices = '[0]' if requested_count == 1 else '[0,1]'
+    example_opts = (
+        '["正解の選択肢","非該当1","非該当2","非該当3","非該当4"]' if requested_count == 1 else
+        '["正解の選択肢1","正解の選択肢2","非該当1","非該当2","非該当3"]'
+    )
     prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
 問題: {row['question']}
@@ -2415,7 +2420,7 @@ def get_mcq(q_id):
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
+{{"options":{example_opts},"correct_indices":{example_indices}}}"""
     try:
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001', max_tokens=800,
@@ -2802,6 +2807,11 @@ def mcq_inline():
         '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
         '設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる'
     )
+    example_indices = '[0]' if requested_count == 1 else '[0,1]'
+    example_opts = (
+        '["正解の選択肢","非該当1","非該当2","非該当3","非該当4"]' if requested_count == 1 else
+        '["正解の選択肢1","正解の選択肢2","非該当1","非該当2","非該当3"]'
+    )
     prompt = f"""以下の記述式問題と正解をもとに、5択選択肢を日本語で作成してください。
 
 問題: {question_text}
@@ -2819,7 +2829,7 @@ def mcq_inline():
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
-{{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
+{{"options":{example_opts},"correct_indices":{example_indices}}}"""
     try:
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
