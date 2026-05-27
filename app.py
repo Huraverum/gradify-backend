@@ -847,9 +847,13 @@ def get_questions(deck_id):
     else:
         diff_clause = ''
         diff_params = []
-    if mcq_cc_raw in ('1', '2'):
+    if mcq_cc_raw == '1':
+        # 「1正解」設定時は NULL (未設定) も 1 扱いに含める
+        mcq_clause = ' AND (q.mcq_correct_count=? OR q.mcq_correct_count IS NULL)'
+        mcq_params = [1]
+    elif mcq_cc_raw == '2':
         mcq_clause = ' AND q.mcq_correct_count=?'
-        mcq_params = [int(mcq_cc_raw)]
+        mcq_params = [2]
     else:
         mcq_clause = ''
         mcq_params = []
@@ -879,7 +883,12 @@ def get_questions(deck_id):
             diff_sql = ' AND difficulty=?'
         else:
             diff_sql = ''
-        mcq_sql = ' AND mcq_correct_count=?' if mcq_cc_raw in ('1', '2') else ''
+        if mcq_cc_raw == '1':
+            mcq_sql = ' AND (mcq_correct_count=? OR mcq_correct_count IS NULL)'
+        elif mcq_cc_raw == '2':
+            mcq_sql = ' AND mcq_correct_count=?'
+        else:
+            mcq_sql = ''
         order   = ' ORDER BY RANDOM()' if shuffle else ' ORDER BY id ASC'
         sql  = f'SELECT * FROM questions WHERE deck_id=? {cat_sql}{diff_sql}{mcq_sql}{order}'
         rows = conn.execute(sql, [deck_id] + cat_params + diff_params + mcq_params).fetchall()
