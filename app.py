@@ -2394,8 +2394,8 @@ def get_mcq(q_id):
         f"・{k['t']}" for k in kps if isinstance(k, dict) and k.get('t'))
     _consume_daily_ai(user_id)
     client = anthropic.Anthropic(api_key=api_key)
-    correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる' if requested_count == 2 else (
-        '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
+    correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる。残り3つは明確に誤った内容にする' if requested_count == 2 else (
+        '設問への答えとして選ぶべき選択肢は必ず1つだけ。残り4つは明確に誤った内容、または論理的に不適切な内容にする（「これも正解では?」と紛らわしい選択肢を作らない）' if requested_count == 1 else
         '設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる'
     )
     example_indices = '[0]' if requested_count == 1 else '[0,1]'
@@ -2417,6 +2417,8 @@ def get_mcq(q_id):
 - 問題文が「誤り」「適切でない」「最も適切でない」などを問う場合は、誤っている／適切でない選択肢を correct_indices に入れる
 - correct_indices に入れる選択肢は模範解答の核心を1〜2文で簡潔に反映する
 - correct_indices 以外の選択肢は、それぞれ異なる方向の非該当選択肢にする
+- 1正解設定の場合は特に: 正解候補が複数あると感じられる選択肢を作らない（「これも正解では?」と迷う選択肢を残り4つに含めない）
+- 同じ概念を別の言い方で表現した正解の言い換えを複数選択肢に分散させない
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
@@ -2487,6 +2489,8 @@ def generate_all_mcq():
 - 問題文が「誤り」「適切でない」「最も適切でない」などを問う場合は、誤っている／適切でない選択肢を correct_indices に入れる
 - correct_indices に入れる選択肢は模範解答の核心を1〜2文で簡潔に反映する
 - correct_indices 以外の選択肢は、それぞれ異なる方向の非該当選択肢にする
+- 1正解設定の場合は特に: 正解候補が複数あると感じられる選択肢を作らない（「これも正解では?」と迷う選択肢を残り4つに含めない）
+- 同じ概念を別の言い方で表現した正解の言い換えを複数選択肢に分散させない
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
@@ -2803,8 +2807,8 @@ def mcq_inline():
     answer_text = model_answer or '\n'.join(
         f"・{k['t']}" for k in key_points if isinstance(k, dict) and k.get('t'))
     _consume_daily_ai(user_id)
-    correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる' if requested_count == 2 else (
-        '設問への答えとして選ぶべき選択肢は必ず1つ' if requested_count == 1 else
+    correct_rule = '設問への答えとして選ぶべき選択肢は必ず2つ。2つとも correct_indices に入れる。残り3つは明確に誤った内容にする' if requested_count == 2 else (
+        '設問への答えとして選ぶべき選択肢は必ず1つだけ。残り4つは明確に誤った内容、または論理的に不適切な内容にする（「これも正解では?」と紛らわしい選択肢を作らない）' if requested_count == 1 else
         '設問への答えとして選ぶべき選択肢は1つまたは2つ。2つ選ぶべき問題では両方を correct_indices に入れる'
     )
     example_indices = '[0]' if requested_count == 1 else '[0,1]'
@@ -2826,6 +2830,8 @@ def mcq_inline():
 - 問題文が「誤り」「適切でない」「最も適切でない」などを問う場合は、誤っている／適切でない選択肢を correct_indices に入れる
 - correct_indices に入れる選択肢は模範解答の核心を1〜2文で簡潔に反映する
 - correct_indices 以外の選択肢は、それぞれ異なる方向の非該当選択肢にする
+- 1正解設定の場合は特に: 正解候補が複数あると感じられる選択肢を作らない（「これも正解では?」と迷う選択肢を残り4つに含めない）
+- 同じ概念を別の言い方で表現した正解の言い換えを複数選択肢に分散させない
 - 各選択肢は30〜60字程度
 
 必ずこのJSONのみを返してください（前後にテキスト不要）:
