@@ -59,6 +59,9 @@ DAILY_AI_LIMIT = int(os.environ.get('DAILY_AI_LIMIT', 5))
 SUB_LIGHT_DAILY_LIMIT    = int(os.environ.get('SUB_LIGHT_DAILY_LIMIT', 7))
 SUB_STANDARD_DAILY_LIMIT = int(os.environ.get('SUB_STANDARD_DAILY_LIMIT', 15))
 SUB_PRO_DAILY_LIMIT      = int(os.environ.get('SUB_PRO_DAILY_LIMIT', 33))
+# 全ユーザー合算の月次AI呼び出し上限。0以下なら無制限。
+# Anthropic APIの予期しない高額化を防ぐ最後のハードストップ。
+MONTHLY_AI_LIMIT         = int(os.environ.get('MONTHLY_AI_LIMIT', 2000))
 
 def _client_id():
     fwd = request.headers.get('X-Forwarded-For', '')
@@ -88,6 +91,58 @@ def _ensure_wallet(conn, user_id):
         'INSERT OR IGNORE INTO wallet(user_id, balance) VALUES(?, 0)',
         (user_id,)
     )
+
+class MonthlyAILimitExceeded(Exception):
+    def __init__(self, used, limit):
+        super().__init__('monthly_ai_limit_exceeded')
+        self.used = used
+        self.limit = limit
+
+def _month_key():
+    return datetime.now().strftime('%Y-%m')
+
+def _reserve_global_ai_call(amount=1):
+    """Reserve global monthly AI budget before an Anthropic call.
+
+    This is intentionally global, not per-user: it caps worst-case monthly spend
+    even if many users each stay within their own daily quota.
+    """
+    limit = MONTHLY_AI_LIMIT
+    if limit <= 0:
+        return True, 0, 0
+    month = _month_key()
+    conn = get_db()
+    try:
+        conn.execute('BEGIN IMMEDIATE')
+        row = conn.execute('SELECT count FROM global_monthly_ai WHERE month=?', (month,)).fetchone()
+        current = row['count'] if row else 0
+        if current + amount > limit:
+            conn.rollback()
+            raise MonthlyAILimitExceeded(current, limit)
+        conn.execute(
+            'INSERT INTO global_monthly_ai (month, count, updated_at) VALUES (?, ?, ?) '
+            'ON CONFLICT(month) DO UPDATE SET count=?, updated_at=?',
+            (month, current + amount, datetime.now().isoformat(timespec='seconds'),
+             current + amount, datetime.now().isoformat(timespec='seconds'))
+        )
+        conn.commit()
+        return True, current + amount, limit
+    finally:
+        conn.close()
+
+def _monthly_ai_limit_response(used, limit):
+    return jsonify({
+        'ok': False,
+        'error': '月間AI利用上限に達しました',
+        'monthly_ai_limit': True,
+        'used': used,
+        'limit': limit,
+        'message': '今月のAI利用上限に達しました。月初にリセットされます。',
+    }), 429
+
+@app.errorhandler(MonthlyAILimitExceeded)
+def _handle_monthly_ai_limit(e):
+    return _monthly_ai_limit_response(e.used, e.limit)
 
 def _check_rate(bucket):
     limit = RATE_LIMITS.get(bucket, 0)
@@ -264,6 +319,7 @@ def _consume_credit(user_id, kind):
 def _consume_daily_ai(user_id):
     """daily が残ってれば消費。なければ gem を1消費。両方無ければ no-op
     (事前 _check_daily_ai で弾く想定)。"""
+    _reserve_global_ai_call()
     limit = _daily_limit_for(user_id)
     if limit == 0:
         return
@@ -519,6 +575,13 @@ def init_db():
             day TEXT NOT NULL,
             count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (user_id, day)
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS global_monthly_ai (
+            month TEXT PRIMARY KEY,
+            count INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT
         )
     ''')
     conn.execute('''
@@ -1005,6 +1068,7 @@ def score():
     ok, current, limit = _check_rate('score')
     if not ok:
         return _rate_limit_response('score', current, limit)
+    _reserve_global_ai_call()
 
     conn = get_db()
     row = conn.execute('SELECT * FROM questions WHERE id=?', (qid,)).fetchone()
@@ -1872,6 +1936,7 @@ def get_attempts():
 
 # ── File Upload & Extraction ──────────────────────────────────
 def _call_extract(blocks, user_key):
+    _reserve_global_ai_call()
     client = anthropic.Anthropic(api_key=user_key)
     msg = client.messages.create(model='claude-sonnet-4-6', max_tokens=4096,
         messages=[{'role':'user','content':blocks}])
@@ -1930,6 +1995,8 @@ def upload_questions():
         else:
             return jsonify({'error': 'PDF/画像/HTML/Excel/Word のみ対応'}), 400
         return jsonify({'questions': _call_extract(blocks, user_key)})
+    except MonthlyAILimitExceeded as e:
+        return _monthly_ai_limit_response(e.used, e.limit)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -2221,6 +2288,7 @@ def vision_quiz():
         try:
             memory_prompt = _vision_quiz_memory_prompt(result)
             if memory_prompt:
+                _reserve_global_ai_call()
                 result = _normalize_vision_quiz_result(_call_vision_quiz(image_bytes, mt, user_key, memory_prompt))
         except Exception as e:
             print('[vision-quiz] memory pass failed (ignored):', e)
@@ -2756,6 +2824,7 @@ def generate_all_mcq():
 必ずこのJSONのみを返してください（前後にテキスト不要）:
 {{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
         try:
+            _reserve_global_ai_call()
             msg = client.messages.create(
                 model='claude-haiku-4-5-20251001', max_tokens=800,
                 messages=[{'role': 'user', 'content': prompt}])
@@ -2872,6 +2941,7 @@ def companion_react():
         return _rate_limit_response('ai', current, limit)
     system_prompt = COMPANION_SYSTEM_SHISHIN.get(companion, COMPANION_SYSTEM_DEFAULT)
     try:
+        _reserve_global_ai_call()
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001',
@@ -3361,6 +3431,7 @@ def generate_questions_by_difficulty(deck_id):
     )
 
     try:
+        _reserve_global_ai_call()
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001',
@@ -3419,6 +3490,7 @@ def similar_question(qid):
         kp_text = '\n'.join(f'・{k["t"]}' for k in kps[:5] if isinstance(k, dict) and k.get('t'))
     except Exception:
         kp_text = row['model_answer'][:300]
+    _reserve_global_ai_call()
     client = anthropic.Anthropic(api_key=api_key)
     prompt = f"""以下の記述式問題と類似した、同じ知識領域だが異なる切り口の問題を1つ作成してください。
 
