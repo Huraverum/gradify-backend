@@ -1376,6 +1376,266 @@ def backfill_knowledge_graph():
     made = _backfill_knowledge_graph_for_user(_user_id())
     return jsonify({'ok': True, 'attempts': made})
 
+@app.route('/api/knowledge-graph/build', methods=['POST'])
+def build_knowledge_graph_payload():
+    """Phase 3 payload-mode: ローカル attempts/questions を受け取って
+    in-memory で knowledge graph (nodes/edges) を組み立てて返す。
+    Railway DB は触らない (user_id 不要)。AI も呼ばない。"""
+    d = request.get_json(force=True) or {}
+    attempts = d.get('attempts') or []
+    questions = d.get('questions') or []
+    deck_id = d.get('deck_id')
+    expand_bridges = bool(d.get('expand'))
+    try:
+        limit = max(20, min(int(d.get('limit') or 240), 500))
+    except Exception:
+        limit = 240
+
+    q_map = {}
+    for q in questions:
+        try:
+            qid = int(q.get('id'))
+        except Exception:
+            continue
+        normalized = dict(q)
+        # key_points は frontend からは配列で来る場合があるので JSON 文字列化
+        kp = normalized.get('key_points')
+        if isinstance(kp, list):
+            normalized['key_points'] = json.dumps(kp, ensure_ascii=False)
+        elif kp is None:
+            normalized['key_points'] = '[]'
+        # _build_concept_card が参照するキーで欠けがちなものを補う
+        normalized.setdefault('guideline_ref', '')
+        normalized.setdefault('model_answer', '')
+        normalized.setdefault('category', '')
+        normalized.setdefault('question', '')
+        normalized['id'] = qid
+        q_map[qid] = normalized
+
+    nodes_map = {}
+    edges_map = {}
+
+    def mem_save_node(*, node_id, type_, label, summary='', body='', source_id='', metadata=None):
+        existing = nodes_map.get(node_id)
+        now = _now_iso()
+        created = existing['created_at'] if existing else now
+        nodes_map[node_id] = {
+            'id': node_id,
+            'user_id': '',
+            'type': type_,
+            'label': (label or type_)[:180],
+            'summary': (summary or '')[:500],
+            'body': body or '',
+            'source_id': source_id or '',
+            'metadata': metadata or {},
+            'created_at': created,
+            'updated_at': now,
+        }
+        return node_id
+
+    def mem_save_edge(*, type_, source, target, metadata=None):
+        edge_id = f"{type_}:{source}:{target}"
+        if edge_id not in edges_map:
+            edges_map[edge_id] = {
+                'id': edge_id,
+                'user_id': '',
+                'type': type_,
+                'source': source,
+                'target': target,
+                'metadata': metadata or {},
+                'created_at': _now_iso(),
+            }
+        return edge_id
+
+    def mem_concept_node(label, *, source_id='', metadata=None, summary='関連知識', body=''):
+        clean = re.sub(r'\s+', ' ', (label or '').strip())
+        if not clean:
+            return None
+        slug = re.sub(r'[^0-9A-Za-zぁ-んァ-ン一-龥ー]+', '-', clean).strip('-').lower()[:80]
+        if not slug:
+            import uuid as _uuid
+            slug = _uuid.uuid4().hex[:8]
+        node_id = f"concept:local:{slug}"
+        return mem_save_node(node_id=node_id, type_='concept', label=clean,
+                              summary=summary, body=body, source_id=source_id,
+                              metadata=metadata or {})
+
+    def mem_record_attempt(qid, attempt_id, question_row, result, answer):
+        q_node = f"question:{qid}"
+        answer_node = f"answer:user:{attempt_id}"
+        agent_node = 'agent:claude'
+        question_text = question_row.get('question') or ''
+        model_answer = result.get('model_answer') or question_row.get('model_answer') or ''
+        category = question_row.get('category') or ''
+        advice = result.get('advice') or ''
+        feedback = result.get('feedback') or ''
+
+        combined_body_parts = []
+        if answer:
+            combined_body_parts.append(f"【あなたの回答】\n{answer}")
+        if model_answer:
+            combined_body_parts.append(f"【模範解答】\n{model_answer}")
+        if advice:
+            combined_body_parts.append(f"【AIアドバイス】\n{advice}")
+        combined_body = '\n\n'.join(combined_body_parts)
+
+        mem_save_node(node_id=q_node, type_='question',
+                      label=question_text[:80] or f'問題 {qid}', summary=category,
+                      body=question_text, source_id=str(qid),
+                      metadata={'questionId': qid, 'category': category})
+        is_mcq = answer in ('5択:正解', '5択:不正解')
+        if is_mcq:
+            answer_label = '回答 ○' if answer == '5択:正解' else '回答 ×'
+        else:
+            answer_label = f"回答 {result.get('grade','')}".strip()
+        mem_save_node(node_id=answer_node, type_='answer',
+                      label=answer_label, summary=feedback, body=combined_body,
+                      source_id=str(attempt_id),
+                      metadata={'questionId': qid, 'attemptId': attempt_id,
+                                'score': result.get('score'), 'grade': result.get('grade'),
+                                'agent': 'claude', 'isMcq': is_mcq})
+        mem_save_node(node_id=agent_node, type_='agent', label='Claude',
+                      summary='採点・解説エージェント', metadata={'provider': 'anthropic'})
+
+        mem_save_edge(type_='generated_from', source=answer_node, target=q_node)
+        mem_save_edge(type_='explains', source=agent_node, target=answer_node)
+
+        concept_labels = [category]
+        concept_labels += result.get('covered') or []
+        concept_labels += result.get('partial') or []
+        concept_labels += result.get('missed') or []
+        seen = set()
+        for label in concept_labels:
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            summary, body, meta = _build_concept_card(question_row, label)
+            meta.update({'questionId': qid, 'conceptLabel': label, 'attemptId': attempt_id})
+            concept = mem_concept_node(label, source_id=str(qid), metadata=meta,
+                                        summary=summary, body=body)
+            if not concept:
+                continue
+            mem_save_edge(type_='relates_to', source=q_node, target=concept)
+            if label in (result.get('missed') or []):
+                mem_save_edge(type_='confused_with', source=answer_node, target=concept)
+            else:
+                mem_save_edge(type_='explains', source=answer_node, target=concept)
+
+    def _coerce_str_list(v):
+        if isinstance(v, list):
+            return [str(x) for x in v if x]
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+                if isinstance(parsed, list):
+                    return [str(x) for x in parsed if x]
+            except Exception:
+                pass
+        return []
+
+    for a in attempts:
+        try:
+            qid = int(a.get('question_id'))
+        except Exception:
+            continue
+        qrow = q_map.get(qid)
+        if not qrow:
+            continue
+        result = {
+            'score': a.get('score'),
+            'grade': a.get('grade'),
+            'model_answer': qrow.get('model_answer') or '',
+            'covered': _coerce_str_list(a.get('covered')),
+            'partial': _coerce_str_list(a.get('partial')),
+            'missed':  _coerce_str_list(a.get('missed')),
+            'feedback': a.get('feedback') or '',
+            'advice':   a.get('advice') or '',
+        }
+        try:
+            attempt_id = a.get('id') or a.get('attempt_id') or f"local-{qid}-{a.get('created_at') or ''}"
+            mem_record_attempt(qid, attempt_id, qrow, result, a.get('answer') or '')
+        except Exception as e:
+            print('[knowledge] mem record failed:', e)
+
+    bridges_info = None
+    if deck_id is not None:
+        try:
+            deck_id_int = int(deck_id)
+        except Exception:
+            deck_id_int = None
+        deck_qids = {int(q.get('id')) for q in questions
+                     if q.get('deck_id') == deck_id_int and q.get('id') is not None}
+        q_node_ids = {f"question:{qid}" for qid in deck_qids}
+        related = set(q_node_ids)
+        for e in edges_map.values():
+            if e['source'] in q_node_ids or e['target'] in q_node_ids:
+                related.add(e['source']); related.add(e['target'])
+        related.add('agent:claude')
+        in_deck_concepts = {nid for nid in related if nid.startswith('concept:')}
+        bridge_q_ids = set()
+        bridge_concept_ids = set()
+        for e in edges_map.values():
+            if e['source'] in in_deck_concepts or e['target'] in in_deck_concepts:
+                for endpoint in (e['source'], e['target']):
+                    if endpoint.startswith('question:') and endpoint not in q_node_ids:
+                        bridge_q_ids.add(endpoint)
+                        for c in (e['source'], e['target']):
+                            if c in in_deck_concepts:
+                                bridge_concept_ids.add(c)
+        other_deck_names = []
+        if bridge_q_ids:
+            ext_ids = set()
+            for nid in bridge_q_ids:
+                try:
+                    ext_ids.add(int(nid.split(':', 1)[1]))
+                except Exception:
+                    pass
+            ext_deck_ids = {q.get('deck_id') for q in questions if int(q.get('id') or -1) in ext_ids}
+            deck_name_map = {}
+            for q in questions:
+                did = q.get('deck_id'); dname = q.get('deck_name')
+                if did is not None and dname:
+                    deck_name_map[did] = dname
+            other_deck_names = sorted({deck_name_map.get(did) for did in ext_deck_ids if deck_name_map.get(did)})
+        bridges_info = {
+            'count': len(bridge_q_ids),
+            'concept_ids': sorted(bridge_concept_ids),
+            'other_deck_names': other_deck_names,
+        }
+        if expand_bridges and bridge_q_ids:
+            related |= bridge_q_ids
+            for e in edges_map.values():
+                if e['source'] in bridge_q_ids or e['target'] in bridge_q_ids:
+                    related.add(e['source']); related.add(e['target'])
+        nodes_filtered = [n for n in nodes_map.values() if n['id'] in related]
+    else:
+        nodes_filtered = list(nodes_map.values())
+
+    nodes_filtered.sort(key=lambda r: r.get('updated_at') or '', reverse=True)
+    nodes_filtered = nodes_filtered[:limit]
+    final_ids = {n['id'] for n in nodes_filtered}
+    edges_filtered = [e for e in edges_map.values()
+                      if e['source'] in final_ids and e['target'] in final_ids][:limit * 2]
+
+    def to_node(n):
+        return {
+            'id': n['id'], 'userId': '', 'type': n['type'],
+            'label': n['label'], 'summary': n['summary'], 'body': n['body'],
+            'sourceId': n['source_id'], 'metadata': n['metadata'],
+            'createdAt': n['created_at'], 'updatedAt': n['updated_at'],
+        }
+    def to_edge(e):
+        return {
+            'id': e['id'], 'userId': '', 'type': e['type'],
+            'source': e['source'], 'target': e['target'],
+            'metadata': e['metadata'], 'createdAt': e['created_at'],
+        }
+    return jsonify({
+        'nodes': [to_node(n) for n in nodes_filtered],
+        'edges': [to_edge(e) for e in edges_filtered],
+        'bridges': bridges_info,
+    })
+
 @app.route('/api/knowledge-graph')
 def get_knowledge_graph():
     user_id = _user_id()
