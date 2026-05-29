@@ -63,6 +63,10 @@ SUB_PRO_DAILY_LIMIT      = int(os.environ.get('SUB_PRO_DAILY_LIMIT', 33))
 # Anthropic APIの予期しない高額化を防ぐ最後のハードストップ。
 MONTHLY_AI_LIMIT         = int(os.environ.get('MONTHLY_AI_LIMIT', 2000))
 
+# 生成問題の最低限の品質ガード。AI監査を毎回追加するとAPIコストが増えるため、
+# まずは既知の高リスク誤情報を保存/キャッシュ前に止める。
+QUALITY_GUARD_ENABLED = os.environ.get('QUALITY_GUARD_ENABLED', '1') != '0'
+
 def _client_id():
     fwd = request.headers.get('X-Forwarded-For', '')
     if fwd:
@@ -85,6 +89,63 @@ def _require_admin():
     if token != ADMIN_API_TOKEN:
         return jsonify({'error': '教材マスターの編集は管理者のみ可能です'}), 403
     return None
+
+FACT_SAFETY_PROMPT = """\
+専門的妥当性:
+- ユーザーのデッキ名・カテゴリ・既存問題の領域を優先し、別領域の前提を持ち込まない。
+- 標準的知識、ガイドライン、主要試験と矛盾する内容を正解選択肢や模範解答に入れない。
+- 施設独自の運用、手続き都合、例外的対応を「一般的」「標準」「原則」として書かない。
+- 不確実な場合は断定せず、問題として採用しない。"""
+
+HIGH_RISK_FACT_PATTERNS = [
+    (
+        re.compile(r'(ペルツズマブ|ペルジェタ).{0,80}(第?2|２|2).{0,20}(サイクル|コース|回目).{0,40}(以降|から).{0,60}(一般|標準|原則)', re.S),
+        'HER2陽性乳癌NACでペルツズマブを第2サイクル以降開始が一般的/標準/原則とする記述は誤情報の可能性が高い',
+    ),
+    (
+        re.compile(r'(一般|標準|原則).{0,60}(ペルツズマブ|ペルジェタ).{0,80}(第?2|２|2).{0,20}(サイクル|コース|回目).{0,40}(以降|から)', re.S),
+        'HER2陽性乳癌NACでペルツズマブを第2サイクル以降開始が一般的/標準/原則とする記述は誤情報の可能性が高い',
+    ),
+]
+
+def _quality_text_from_payload(payload):
+    parts = []
+    if isinstance(payload, dict):
+        for key in ('question', 'model_answer', 'guideline_ref', 'flowchart', 'explanation'):
+            val = payload.get(key)
+            if val:
+                parts.append(str(val))
+        kps = payload.get('key_points')
+        if isinstance(kps, list):
+            for kp in kps:
+                if isinstance(kp, dict) and kp.get('t'):
+                    parts.append(str(kp.get('t')))
+                elif kp:
+                    parts.append(str(kp))
+        opts = payload.get('options')
+        if isinstance(opts, list):
+            parts.extend(str(o) for o in opts if o)
+    return '\n'.join(parts)
+
+def _quality_guard(payload):
+    if not QUALITY_GUARD_ENABLED:
+        return {'ok': True, 'confidence': 'not_checked', 'flags': []}
+    text = _quality_text_from_payload(payload)
+    flags = []
+    for pattern, reason in HIGH_RISK_FACT_PATTERNS:
+        if pattern.search(text):
+            flags.append(reason)
+    return {
+        'ok': not flags,
+        'confidence': 'low' if flags else 'medium',
+        'flags': flags,
+    }
+
+def _ensure_quality_ok(payload):
+    audit = _quality_guard(payload)
+    if not audit['ok']:
+        raise ValueError('医学的妥当性チェックに失敗しました: ' + ' / '.join(audit['flags']))
+    return audit
 
 def _ensure_wallet(conn, user_id):
     conn.execute(
@@ -2749,6 +2810,8 @@ def get_mcq(q_id):
 - 同じ概念を別の言い方で表現した正解の言い換えを複数選択肢に分散させない
 - 各選択肢は30〜60字程度
 
+{FACT_SAFETY_PROMPT}
+
 必ずこのJSONのみを返してください（前後にテキスト不要）:
 {{"options":{example_opts},"correct_indices":{example_indices}}}"""
     try:
@@ -2758,6 +2821,11 @@ def get_mcq(q_id):
         raw = msg.content[0].text.strip()
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
         normalized = _normalize_mcq_payload(data)
+        _ensure_quality_ok({
+            'question': row['question'],
+            'model_answer': answer_text,
+            'options': normalized['options'],
+        })
         result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
         conn.execute('UPDATE questions SET mcq_options=? WHERE id=?', (json.dumps(result, ensure_ascii=False), q_id))
         conn.commit()
@@ -2821,6 +2889,8 @@ def generate_all_mcq():
 - 同じ概念を別の言い方で表現した正解の言い換えを複数選択肢に分散させない
 - 各選択肢は30〜60字程度
 
+{FACT_SAFETY_PROMPT}
+
 必ずこのJSONのみを返してください（前後にテキスト不要）:
 {{"options":["選ぶべき選択肢1","選ぶべき選択肢2または非該当","非該当1","非該当2","非該当3"],"correct_indices":[0,1]}}"""
         try:
@@ -2831,6 +2901,11 @@ def generate_all_mcq():
             raw = msg.content[0].text.strip()
             data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
             normalized = _normalize_mcq_payload(data)
+            _ensure_quality_ok({
+                'question': row['question'],
+                'model_answer': answer_text,
+                'options': normalized['options'],
+            })
             result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
             c = get_db()
             c.execute('UPDATE questions SET mcq_options=? WHERE id=?',
@@ -2952,8 +3027,94 @@ def companion_react():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
-# ── Inconsistency feedback ────────────────────────────────────
-FEEDBACK_TAGS = {'因果飛び', '話者不明', '状態矛盾', '補完過剰', 'その他'}
+# ── Inconsistency / question quality feedback ─────────────────
+FEEDBACK_TAGS = {'因果飛び', '話者不明', '状態矛盾', '補完過剰', '医学的に怪しい', '正解が違う', '解説が怪しい', 'その他'}
+
+def _admin_token_from_request():
+    return (
+        request.headers.get('X-Admin-Token')
+        or request.headers.get('Authorization', '').removeprefix('Bearer ').strip()
+        or request.args.get('token')
+        or ''
+    )
+
+def _require_admin_view():
+    if not ADMIN_API_TOKEN:
+        return jsonify({'error': 'admin token is not configured'}), 403
+    if _admin_token_from_request() != ADMIN_API_TOKEN:
+        return jsonify({'error': 'forbidden'}), 403
+    return None
+
+@app.route('/api/feedback', methods=['GET'])
+def list_feedback():
+    denied = _require_admin_view()
+    if denied: return denied
+    try:
+        limit = int(request.args.get('limit') or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT id, scene_id, tag, comment, context_json, user_token, created_at '
+        'FROM feedback ORDER BY id DESC LIMIT ?',
+        (limit,),
+    ).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        try:
+            context = json.loads(r['context_json'] or '{}')
+        except Exception:
+            context = {}
+        items.append({
+            'id': r['id'],
+            'scene_id': r['scene_id'],
+            'tag': r['tag'],
+            'comment': r['comment'],
+            'context': context,
+            'user_token': r['user_token'],
+            'created_at': r['created_at'],
+        })
+    return jsonify({'ok': True, 'feedback': items})
+
+@app.route('/admin/feedback')
+def feedback_admin_page():
+    denied = _require_admin_view()
+    if denied: return denied
+    try:
+        limit = int(request.args.get('limit') or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    conn = get_db()
+    rows = conn.execute(
+        'SELECT id, scene_id, tag, comment, context_json, user_token, created_at '
+        'FROM feedback ORDER BY id DESC LIMIT ?',
+        (limit,),
+    ).fetchall()
+    conn.close()
+    def esc(v):
+        import html
+        return html.escape(str(v or ''))
+    body = []
+    for r in rows:
+        try:
+            ctx = json.dumps(json.loads(r['context_json'] or '{}'), ensure_ascii=False, indent=2)
+        except Exception:
+            ctx = r['context_json'] or '{}'
+        body.append(f'''<article class="card">
+  <div class="meta">#{r['id']} / {esc(r['created_at'])} / {esc(r['tag'])} / user: {esc(r['user_token'])}</div>
+  <h2>{esc(r['scene_id'])}</h2>
+  <p>{esc(r['comment'])}</p>
+  <pre>{esc(ctx)}</pre>
+</article>''')
+    html_doc = f'''<!doctype html>
+<html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Gradify Feedback</title>
+<style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f172a;color:#e5e7eb;margin:0;padding:24px}}h1{{font-size:22px}}.card{{background:#111827;border:1px solid #334155;border-radius:8px;padding:16px;margin:14px 0}}.meta{{color:#93c5fd;font-size:12px}}h2{{font-size:16px;margin:8px 0}}p{{white-space:pre-wrap;line-height:1.55}}pre{{background:#020617;border:1px solid #1f2937;border-radius:6px;padding:12px;overflow:auto;white-space:pre-wrap}}</style>
+</head><body><h1>Gradify Feedback</h1>{''.join(body) or '<p>No feedback.</p>'}</body></html>'''
+    return Response(html_doc, mimetype='text/html')
 
 @app.route('/api/feedback', methods=['POST'])
 def submit_feedback():
@@ -3164,6 +3325,8 @@ def mcq_inline():
 - 同じ概念を別の言い方で表現した正解の言い換えを複数選択肢に分散させない
 - 各選択肢は30〜60字程度
 
+{FACT_SAFETY_PROMPT}
+
 必ずこのJSONのみを返してください（前後にテキスト不要）:
 {{"options":{example_opts},"correct_indices":{example_indices}}}"""
     try:
@@ -3174,7 +3337,13 @@ def mcq_inline():
         raw = msg.content[0].text.strip()
         data = json.loads(re.search(r'\{.*\}', raw, re.S).group())
         normalized = _normalize_mcq_payload(data)
+        audit = _ensure_quality_ok({
+            'question': question_text,
+            'model_answer': answer_text,
+            'options': normalized['options'],
+        })
         result = _shuffle_mcq(normalized['options'], normalized['correct_indices'])
+        result['quality_audit'] = audit
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -3234,6 +3403,8 @@ def similar_inline():
 - 難易度は同程度
 - key_pointsは3〜5個
 
+{FACT_SAFETY_PROMPT}
+
 必ずこのJSONのみを返してください（前後にテキスト不要）:
 {{"question":"問題文","model_answer":"模範解答（100字以内）","key_points":[{{"t":"要点1"}},{{"t":"要点2"}},{{"t":"要点3"}}],"category":"{category}"}}"""
     msg = client.messages.create(
@@ -3241,6 +3412,7 @@ def similar_inline():
         messages=[{'role': 'user', 'content': prompt}])
     raw = msg.content[0].text.strip()
     result = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+    result['quality_audit'] = _ensure_quality_ok(result)
     return jsonify(result)
 
 @app.route('/api/generate-questions-inline', methods=['POST'])
@@ -3284,6 +3456,7 @@ def generate_questions_inline():
         '- model_answer は適切な字数で簡潔に\n'
         '- 各問題の key_points は difficulty に合わせた個数\n'
         '- 既存問題と同じテーマは避ける\n\n'
+        f'{FACT_SAFETY_PROMPT}\n\n'
         '必ずこのJSONのみを返してください（前後にテキスト不要）:\n'
         f'{{"questions":[{{"question":"問題文","model_answer":"模範解答","key_points":[{{"t":"要点1"}},{{"t":"要点2"}}],"category":"{cat_for_json}"}}]}}'
     )
@@ -3303,11 +3476,20 @@ def generate_questions_inline():
         new_qs = (parsed.get('questions') or [])[:count]
     except Exception as e:
         return jsonify({'error': f'生成に失敗しました: {e}'}), 502
-    # 難易度フィールドを各問題に追加して返す
+    # 難易度フィールドを各問題に追加して返す。低信頼の生成物は端末保存前に落とす。
+    checked_qs = []
+    quality_errors = []
     for q in new_qs:
         q.setdefault('difficulty', difficulty)
         q.setdefault('category', category or deck_name)
-    return jsonify({'ok': True, 'questions': new_qs, 'difficulty': difficulty, 'count': len(new_qs)})
+        try:
+            audit = _ensure_quality_ok(q)
+        except ValueError as e:
+            quality_errors.append({'question': (q.get('question') or '')[:120], 'error': str(e)})
+            continue
+        q['quality_audit'] = audit
+        checked_qs.append(q)
+    return jsonify({'ok': True, 'questions': checked_qs, 'difficulty': difficulty, 'count': len(checked_qs), 'quality_errors': quality_errors})
 
 # ── Weakness radar ───────────────────────────────────────────
 @app.route('/api/weakness-radar')
@@ -3426,6 +3608,7 @@ def generate_questions_by_difficulty(deck_id):
         '- model_answer は適切な字数で簡潔に\n'
         '- 各問題の key_points は difficulty に合わせた個数\n'
         '- 既存問題と同じテーマは避ける\n\n'
+        f'{FACT_SAFETY_PROMPT}\n\n'
         '必ずこのJSONのみを返してください（前後にテキスト不要）:\n'
         f'{{"questions":[{{"question":"問題文","model_answer":"模範解答","key_points":[{{"t":"要点1"}},{{"t":"要点2"}}],"category":"{cat_for_json}"}}]}}'
     )
@@ -3451,9 +3634,15 @@ def generate_questions_by_difficulty(deck_id):
     now = datetime.now().strftime('%Y-%m-%d %H:%M')
     owner = deck['owner_id'] or user_id
     inserted_ids = []
+    quality_errors = []
     for q in new_qs[:count]:
         text = (q.get('question') or '').strip()
         if not text:
+            continue
+        try:
+            _ensure_quality_ok(q)
+        except ValueError as e:
+            quality_errors.append({'question': text[:120], 'error': str(e)})
             continue
         kps = q.get('key_points') or []
         cat_val = (q.get('category') or category or deck_name).strip()
@@ -3466,7 +3655,7 @@ def generate_questions_by_difficulty(deck_id):
         inserted_ids.append(cur.lastrowid)
     conn.commit()
     conn.close()
-    return jsonify({'ok': True, 'ids': inserted_ids, 'count': len(inserted_ids), 'difficulty': difficulty})
+    return jsonify({'ok': True, 'ids': inserted_ids, 'count': len(inserted_ids), 'difficulty': difficulty, 'quality_errors': quality_errors})
 
 @app.route('/api/questions/<int:qid>/similar', methods=['POST'])
 def similar_question(qid):
@@ -3505,6 +3694,8 @@ def similar_question(qid):
 - 難易度は同程度
 - key_pointsは3〜5個
 
+{FACT_SAFETY_PROMPT}
+
 必ずこのJSONのみを返してください（前後にテキスト不要）:
 {{"question":"問題文","model_answer":"模範解答（100字以内）","key_points":[{{"t":"要点1"}},{{"t":"要点2"}},{{"t":"要点3"}}],"category":"{row['category']}"}}"""
     msg = client.messages.create(
@@ -3512,6 +3703,7 @@ def similar_question(qid):
         messages=[{'role': 'user', 'content': prompt}])
     raw    = msg.content[0].text.strip()
     result = json.loads(re.search(r'\{.*\}', raw, re.S).group())
+    result['quality_audit'] = _ensure_quality_ok(result)
     return jsonify(result)
 
 # ── Wipe all user data ────────────────────────────────────────
