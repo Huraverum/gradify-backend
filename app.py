@@ -54,6 +54,13 @@ RATE_LIMITS = {
 
 TRIAL_DAYS = int(os.environ.get('TRIAL_DAYS', 7))
 DAILY_AI_LIMIT = int(os.environ.get('DAILY_AI_LIMIT', 5))
+# 開発者用バイパス。ここに列挙された user_id は daily 上限・トライアル期限を無視する。
+# 月次 MONTHLY_AI_LIMIT は安全弁として残る。
+DEV_USER_IDS = {
+    uid for uid in (
+        u.strip() for u in os.environ.get('GRADIFY_DEV_USER_IDS', '').split(',')
+    ) if uid
+}
 # サブスクのティア別 1日上限 (AI採点・MCQ生成・写真クイズ等のAIコール数)
 # シンプル採点モードはこの枠を消費しない
 SUB_LIGHT_DAILY_LIMIT    = int(os.environ.get('SUB_LIGHT_DAILY_LIMIT', 7))
@@ -229,8 +236,20 @@ def _check_rate(bucket):
     conn.close()
     return True, current + 1, limit
 
+def _is_dev_user(user_id):
+    return user_id in DEV_USER_IDS
+
 def _check_trial(user_id):
     """Returns dict with status: active|expired|subscribed, days_left, subscribed, tier, first_use_at."""
+    if _is_dev_user(user_id):
+        return {
+            'status': 'subscribed',
+            'days_left': 0,
+            'subscribed': True,
+            'tier': 'pro',
+            'first_use_at': '',
+            'dev': True,
+        }
     conn = get_db()
     row = conn.execute('SELECT first_use_at, subscribed, subscribed_tier FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
     if not row:
@@ -274,7 +293,10 @@ def _trial_expired_response():
 
 def _daily_limit_for(user_id):
     """Returns the user's daily AI limit. tier別の上限を返す。
-    無料: DAILY_AI_LIMIT / light: SUB_LIGHT / standard: SUB_STANDARD / pro: SUB_PRO"""
+    無料: DAILY_AI_LIMIT / light: SUB_LIGHT / standard: SUB_STANDARD / pro: SUB_PRO
+    開発者は 0 (無制限) を返す。"""
+    if _is_dev_user(user_id):
+        return 0
     info = _check_trial(user_id)
     if info.get('subscribed'):
         tier = (info.get('tier') or 'standard').lower()
@@ -424,15 +446,17 @@ def entitlement():
     day = datetime.now().strftime('%Y-%m-%d')
     used = _daily_ai_used(user_id, day)
     gems = _get_gem_balance(user_id)
+    dev = _is_dev_user(user_id)
     return jsonify({
         'subscribed': bool(info.get('subscribed')),
         'tier': info.get('tier'),
         # buyout は廃止。互換のため false を返し続ける
         'buyout': False,
-        'unlimited': False,
+        'unlimited': dev,
+        'dev': dev,
         'daily_used': used,
         'daily_limit': limit,
-        'daily_remaining': max(0, limit - used),
+        'daily_remaining': None if dev else max(0, limit - used),
         'gem_balance': gems,
     })
 
