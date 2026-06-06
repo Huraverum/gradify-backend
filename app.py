@@ -3761,7 +3761,7 @@ SUB_PRO_PRODUCT_ID      = os.environ.get('RC_SUB_PRO_PRODUCT_ID',      'gradify_
 GEM_PRODUCTS = {
     os.environ.get('RC_GEMS_TRIAL_PRODUCT_ID',      'gradify_gems_trial'):      100,
     os.environ.get('RC_GEMS_STANDARD_PRODUCT_ID',   'gradify_gems_standard'):   450,
-    os.environ.get('RC_GEMS_VALUE_PRODUCT_ID',      'gradify_gems_value'):      1200,
+    os.environ.get('RC_GEMS_VALUE_PRODUCT_ID',      'gradify_gems_value_pack'): 1200,
     os.environ.get('RC_GEMS_BULK_PRODUCT_ID',       'gradify_gems_bulk'):       2500,
 }
 
