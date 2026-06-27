@@ -3816,6 +3816,54 @@ def revenuecat_webhook():
         'tier': tier, 'gems_granted': gems_to_grant, 'gem_balance': gem_balance_after,
     })
 
+# ── Dev grant (dev-client IAP stub) ──────────────────────────
+DEV_GRANT_TOKEN = os.environ.get('DEV_GRANT_TOKEN', '')
+
+def _require_dev_grant():
+    if not DEV_GRANT_TOKEN:
+        return jsonify({'error': 'dev grant disabled'}), 403
+    token = request.headers.get('X-Dev-Token', '')
+    if token != DEV_GRANT_TOKEN:
+        return jsonify({'error': 'invalid dev token'}), 403
+    return None
+
+@app.route('/api/dev/grant-tier', methods=['POST'])
+def dev_grant_tier():
+    denied = _require_dev_grant()
+    if denied: return denied
+    body = request.get_json(silent=True) or {}
+    tier = body.get('tier')
+    if tier not in ('light', 'standard', 'pro', None):
+        return jsonify({'error': 'tier must be light|standard|pro|null'}), 400
+    user_id = _user_id()
+    conn = get_db()
+    row = conn.execute('SELECT first_use_at FROM user_trial WHERE user_id=?', (user_id,)).fetchone()
+    if not row:
+        first = datetime.now().isoformat(timespec='seconds')
+        conn.execute('INSERT INTO user_trial(user_id, first_use_at, subscribed, subscribed_tier) VALUES(?, ?, 0, NULL)', (user_id, first))
+    if tier is None:
+        conn.execute('UPDATE user_trial SET subscribed=0, subscribed_tier=NULL WHERE user_id=?', (user_id,))
+    else:
+        conn.execute('UPDATE user_trial SET subscribed=1, subscribed_tier=? WHERE user_id=?', (tier, user_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'user_id': user_id, 'tier': tier})
+
+@app.route('/api/dev/grant-gems', methods=['POST'])
+def dev_grant_gems():
+    denied = _require_dev_grant()
+    if denied: return denied
+    body = request.get_json(silent=True) or {}
+    try:
+        amount = int(body.get('amount', 0))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'amount must be int'}), 400
+    if amount == 0:
+        return jsonify({'error': 'amount must be non-zero'}), 400
+    user_id = _user_id()
+    balance = _grant_gems(user_id, amount)
+    return jsonify({'ok': True, 'user_id': user_id, 'granted': amount, 'balance': balance})
+
 # ── Health check ──────────────────────────────────────────────
 @app.route('/health')
 @app.route('/api/health')
