@@ -3535,6 +3535,59 @@ def weakness_radar():
     conn.close()
     return jsonify([dict(r) for r in rows])
 
+# ── Today's review (forgetting curve × weakness) ─────────────
+@app.route('/api/today-review')
+def today_review():
+    """3問だけ厳選: 弱点 × 経過日数 で「忘れかけ」スコア top-N。
+    新規ユーザー(attemptsゼロ)はランダム n問でコールドスタート。"""
+    user_id = _user_id()
+    try:
+        n = max(1, min(int(request.args.get('n', 3)), 10))
+    except (TypeError, ValueError):
+        n = 3
+    conn = get_db()
+    rows = conn.execute('''
+        SELECT q.*,
+               ROUND(AVG(a.score), 1) AS avg_score,
+               MAX(a.attempted_at)    AS last_attempted_at,
+               COUNT(a.id)            AS attempt_count
+        FROM questions q
+        JOIN attempts a ON a.question_id = q.id
+        JOIN decks d    ON d.id = q.deck_id
+        WHERE a.user_id = ?
+          AND (d.owner_id = ? OR d.owner_id IS NULL)
+        GROUP BY q.id
+        HAVING AVG(a.score) < 80
+        ORDER BY (julianday('now') - julianday(MAX(a.attempted_at)) + 0.5)
+                 * (100 - AVG(a.score)) DESC
+        LIMIT ?
+    ''', (user_id, user_id, n)).fetchall()
+    source = 'forgetting_curve'
+    if not rows:
+        rows = conn.execute('''
+            SELECT q.*, NULL AS avg_score, NULL AS last_attempted_at, 0 AS attempt_count
+            FROM questions q
+            JOIN decks d ON d.id = q.deck_id
+            WHERE (d.owner_id = ? OR d.owner_id IS NULL)
+            ORDER BY RANDOM()
+            LIMIT ?
+        ''', (user_id, n)).fetchall()
+        source = 'random_cold_start'
+    conn.close()
+    questions = []
+    for r in rows:
+        q = dict(r)
+        try:
+            q['key_points'] = json.loads(q.get('key_points') or '[]')
+        except Exception:
+            q['key_points'] = []
+        questions.append(q)
+    return jsonify({
+        'questions': questions,
+        'count': len(questions),
+        'source': source,
+    })
+
 # ── Mistake cards ─────────────────────────────────────────────
 @app.route('/api/mistake-cards')
 def mistake_cards():
