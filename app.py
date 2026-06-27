@@ -663,6 +663,14 @@ def init_db():
         )
     ''')
     conn.execute('''
+        CREATE TABLE IF NOT EXISTS user_tower_theme (
+            user_id    TEXT PRIMARY KEY,
+            theme_json TEXT NOT NULL,
+            seed_label TEXT,
+            updated_at TEXT NOT NULL
+        )
+    ''')
+    conn.execute('''
         CREATE TABLE IF NOT EXISTS global_monthly_ai (
             month TEXT PRIMARY KEY,
             count INTEGER NOT NULL DEFAULT 0,
@@ -3868,6 +3876,154 @@ def revenuecat_webhook():
         'ok': True, 'event_type': event_type, 'user_id': user_id,
         'tier': tier, 'gems_granted': gems_to_grant, 'gem_balance': gem_balance_after,
     })
+
+# ── Tower theme (AI-generated per user) ──────────────────────
+TOWER_THEME_PROMPT = """\
+あなたは学習アプリ「反復堂」の世界観デザイナー。
+ユーザーの学習内容から、すごろくRPG風の塔の階層名とボス名を生成する。
+
+入力(ユーザー学習サンプル):
+{seed_text}
+
+要件:
+- 10塔。各塔は3階層持つ(=30階層名)。
+- 各塔に5体のボス(塔1と塔10は6体目=ラスボスあり)。
+- 階層名: 4〜10文字、〇〇の間 / 〇〇の庭 / 〇〇の祭壇 など、和ファンタジー調の語尾を統一感持って使う。
+- ボス名: 6〜14文字、「概念+生物/役職+カタカナ名」のパターン(例:「時縛りのクロノス」「迷宮司書ラビリス」「天秤王エビデンス」)。
+- ユーザー学習サンプルから抽出したコアコンセプトを各塔に反映、ただし**直接的な学術用語や専門用語そのままは避けて**比喩的に表現。
+- すべての名前は和ファンタジー世界観に統一(医療・法律・特定職業の名前そのままはNG)。
+- 暴力的、差別的、性的、政治的、宗教的に偏った表現は禁止。
+
+出力JSONのみ(前後テキスト禁止):
+{{
+  "floor_names": [
+    ["塔1階層1名", "塔1階層2名", "塔1階層3名"],
+    ... (10塔分)
+  ],
+  "boss_names": [
+    {{"5": "塔1ボス1名", "10": "塔1ボス2名", "15": "塔1ボス3名", "20": "塔1ボス4名", "25": "塔1ボス5名", "30": "塔1ラスボス名"}},
+    {{"5": "塔2ボス1名", "10": "塔2ボス2名", "15": "塔2ボス3名", "20": "塔2ボス4名", "25": "塔2ボス5名"}},
+    ... (10塔分、塔10は30含む)
+  ]
+}}"""
+
+def _gather_tower_seed(user_id, conn, deck_id=None, max_sample=6):
+    """ユーザーの学習サンプルを集めてプロンプト種にする。"""
+    parts = []
+    if deck_id:
+        deck = conn.execute('SELECT name, description, category FROM decks WHERE id=?', (deck_id,)).fetchone()
+        if deck:
+            parts.append(f"デッキ: {deck['name']}")
+            if deck['description']: parts.append(f"説明: {deck['description']}")
+            if deck['category']: parts.append(f"カテゴリ: {deck['category']}")
+        qs = conn.execute(
+            'SELECT question, category FROM questions WHERE deck_id=? ORDER BY id LIMIT ?',
+            (deck_id, max_sample)
+        ).fetchall()
+    else:
+        decks = conn.execute(
+            'SELECT id, name, category FROM decks WHERE owner_id=? OR owner_id IS NULL ORDER BY id LIMIT 5',
+            (user_id,)
+        ).fetchall()
+        for d in decks:
+            label = d['name']
+            if d['category']: label += f"({d['category']})"
+            parts.append(f"デッキ: {label}")
+        qs = conn.execute('''
+            SELECT q.question, q.category
+            FROM questions q
+            JOIN decks d ON d.id = q.deck_id
+            WHERE d.owner_id = ? OR d.owner_id IS NULL
+            ORDER BY q.id LIMIT ?
+        ''', (user_id, max_sample)).fetchall()
+    for q in qs:
+        text = (q['question'] or '').strip()
+        if not text: continue
+        parts.append(f"問題例: {text[:120]}")
+    return '\n'.join(parts) or 'サンプルなし'
+
+def _validate_tower_theme(data):
+    floors = data.get('floor_names')
+    bosses = data.get('boss_names')
+    if not isinstance(floors, list) or len(floors) != 10: return False
+    for f in floors:
+        if not isinstance(f, list) or len(f) != 3: return False
+        if any(not isinstance(x, str) or not x.strip() for x in f): return False
+    if not isinstance(bosses, list) or len(bosses) != 10: return False
+    for b in bosses:
+        if not isinstance(b, dict): return False
+        for k in ('5','10','15','20','25'):
+            v = b.get(k)
+            if not isinstance(v, str) or not v.strip(): return False
+    if not bosses[0].get('30') or not bosses[9].get('30'): return False
+    return True
+
+@app.route('/api/tower-theme', methods=['GET'])
+def get_tower_theme():
+    user_id = _user_id()
+    conn = get_db()
+    row = conn.execute('SELECT theme_json, seed_label, updated_at FROM user_tower_theme WHERE user_id=?', (user_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'theme': None, 'updated_at': None, 'seed_label': None})
+    try:
+        theme = json.loads(row['theme_json'])
+    except Exception:
+        theme = None
+    return jsonify({'theme': theme, 'updated_at': row['updated_at'], 'seed_label': row['seed_label']})
+
+@app.route('/api/tower-theme', methods=['DELETE'])
+def delete_tower_theme():
+    user_id = _user_id()
+    conn = get_db()
+    conn.execute('DELETE FROM user_tower_theme WHERE user_id=?', (user_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
+
+@app.route('/api/tower-theme/generate', methods=['POST'])
+def generate_tower_theme():
+    user_id = _user_id()
+    api_key = ANTHROPIC_API_KEY
+    if not api_key:
+        return jsonify({'error': 'APIキーが未設定です'}), 401
+    body = request.get_json(silent=True) or {}
+    deck_id = body.get('deck_id')
+    try:
+        deck_id = int(deck_id) if deck_id is not None else None
+    except (TypeError, ValueError):
+        deck_id = None
+    conn = get_db()
+    seed_text = _gather_tower_seed(user_id, conn, deck_id=deck_id)
+    seed_label = (body.get('seed_label') or '').strip()[:80] or (seed_text.split('\n', 1)[0][:80])
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=3000,
+            messages=[{'role': 'user', 'content': TOWER_THEME_PROMPT.format(seed_text=seed_text)}],
+        )
+        raw = msg.content[0].text.strip()
+        match = re.search(r'\{.*\}', raw, re.S)
+        if not match:
+            conn.close()
+            return jsonify({'error': 'AI出力をJSONとして解釈できませんでした'}), 500
+        data = json.loads(match.group())
+        if not _validate_tower_theme(data):
+            conn.close()
+            return jsonify({'error': 'AI出力の構造が不正です(floor=10x3, boss=10dictの5キー必須)'}), 500
+        now = datetime.now().isoformat(timespec='seconds')
+        conn.execute(
+            'INSERT INTO user_tower_theme(user_id, theme_json, seed_label, updated_at) VALUES(?, ?, ?, ?) '
+            'ON CONFLICT(user_id) DO UPDATE SET theme_json=excluded.theme_json, seed_label=excluded.seed_label, updated_at=excluded.updated_at',
+            (user_id, json.dumps(data, ensure_ascii=False), seed_label, now),
+        )
+        conn.commit()
+        conn.close()
+        return jsonify({'theme': data, 'seed_label': seed_label, 'updated_at': now})
+    except Exception as e:
+        conn.close()
+        return jsonify({'error': str(e)}), 500
 
 # ── Dev grant (dev-client IAP stub) ──────────────────────────
 DEV_GRANT_TOKEN = os.environ.get('DEV_GRANT_TOKEN', '')
